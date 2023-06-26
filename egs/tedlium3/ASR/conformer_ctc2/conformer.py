@@ -108,6 +108,13 @@ class Conformer(Transformer):
 
         self.encoder_pos = RelPositionalEncoding(d_model, dropout)
 
+        assert self.num_encoder_layers/2 == 0, ('Number of encoder layers must be an even number!')
+        
+        self.encoder_output_layer = nn.ModuleList([nn.Sequential(
+            nn.Dropout(p=dropout), ScaledLinear(d_model, num_classes, bias=True)
+        )] for i in range(1,self.num_encoder_layers/2))
+        
+
         encoder_layer = ConformerEncoderLayer(
             d_model=d_model,
             nhead=nhead,
@@ -165,9 +172,63 @@ class Conformer(Transformer):
 
         x = self.encoder(
             x, pos_emb, src_key_padding_mask=mask, warmup=warmup
-        )  # (S, N, C)
+        )  # x now is a list of intermediate + final layers output from the Conformer Encoder. Each layer has size (S, N, C)
 
         return x, mask
+
+    
+    def forward(
+            self,
+            x: torch.Tensor,
+            supervision: Optional[Supervisions] = None,
+            warmup: float = 1.0,
+            ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Args:
+          x:
+            The input tensor. Its shape is (N, S, C).
+          supervision:
+            Supervision in lhotse format.
+            See https://github.com/lhotse-speech/lhotse/blob/master/lhotse/dataset/speech_recognition.py#L32  # noqa
+            (CAUTION: It contains length information, i.e., start and number of
+             frames, before subsampling)
+          warmup:
+            a floating point value that gradually increases from 0 throughout
+            training; when it is >= 1.0 we are "fully warmed up". It is used
+            to turn modules on sequentially.
+    
+        Returns:
+          Return a tuple containing 3 tensors:
+            - CTC output for ctc decoding. Its shape is (N, S, C)
+            - Encoder output with shape (S, N, C). It can be used as key and
+              value for the decoder.
+            - Encoder output padding mask. It can be used as
+              memory_key_padding_mask for the decoder. Its shape is (N, S).
+              It is None if `supervision` is None.
+        """
+    
+        encoder_memory, memory_key_padding_mask = self.run_encoder(
+            x, supervision, warmup
+        )
+    
+        x = self.ctc_output(encoder_memory)
+        return x, encoder_memory, memory_key_padding_mask
+    
+    def ctc_output(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+          x:
+            the output tensor from the transformer encoder;
+            its shape is (S, N, C)
+    
+        Returns:
+          Return a tensor that can be used for CTC decoding.
+          Its shape is (N, S, C)
+        """
+        x = self.encoder_output_layer(x)
+        x = x.permute(1, 0, 2)  # (S, N, C) -> (N, S, C)
+        x = nn.functional.log_softmax(x, dim=-1)  # (N, S, C)
+        return x
 
 
 class ConformerEncoderLayer(nn.Module):
@@ -360,17 +421,17 @@ class ConformerEncoder(nn.Module):
         )
         self.num_layers = num_layers
 
-        assert len(set(aux_layers)) == len(aux_layers)
+        #assert len(set(aux_layers)) == len(aux_layers)
 
-        assert num_layers - 1 not in aux_layers
-        self.aux_layers = aux_layers + [num_layers - 1]
+        #assert num_layers - 1 not in aux_layers
+        #self.aux_layers = aux_layers + [num_layers - 1]
 
-        self.combiner = RandomCombine(
-            num_inputs=len(self.aux_layers),
-            final_weight=0.5,
-            pure_prob=0.333,
-            stddev=2.0,
-        )
+        #self.combiner = RandomCombine(
+        #    num_inputs=len(self.aux_layers),
+        #    final_weight=0.5,
+        #    pure_prob=0.333,
+        #    stddev=2.0,
+        #)
 
     def forward(
         self,
@@ -406,7 +467,7 @@ class ConformerEncoder(nn.Module):
         output = src
 
         outputs = []
-        for i, mod in enumerate(self.layers):
+        for i, mod in enumerate(1,self.layers+1):
             output = mod(
                 output,
                 pos_emb,
@@ -415,13 +476,14 @@ class ConformerEncoder(nn.Module):
                 warmup=warmup,
             )
 
-            if i in self.aux_layers:
+            #if i in self.aux_layers:
+            #    outputs.append(output)
+            if (i%2) == 0:
                 outputs.append(output)
+        #output = self.combiner(outputs)
 
-        output = self.combiner(outputs)
-
-        return output
-
+        return outputs
+        
 
 class RelPositionalEncoding(torch.nn.Module):
     """
