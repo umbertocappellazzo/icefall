@@ -19,6 +19,14 @@ import math
 import warnings
 from typing import Optional, Tuple, Union
 
+from scaling import (
+    ActivationBalancer,
+    BasicNorm,
+    DoubleSwish,
+    ScaledConv1d,
+    ScaledLinear,
+)
+
 import torch
 from torch import Tensor, nn
 from transformer import Supervisions, Transformer, encoder_padding_mask
@@ -71,7 +79,8 @@ class Conformer(Transformer):
             vgg_frontend=vgg_frontend,
             use_feat_batchnorm=use_feat_batchnorm,
         )
-
+        
+        self.num_encoder_layers = num_encoder_layers
         self.encoder_pos = RelPositionalEncoding(d_model, dropout)
 
         use_conv_batchnorm = True
@@ -94,10 +103,19 @@ class Conformer(Transformer):
             # Note: TorchScript detects that self.after_norm could be used inside forward()
             #       and throws an error without this change.
             self.after_norm = identity
+        
+        self.encoder_output_layer = nn.ModuleList()
+        for i in range(0,self.num_encoder_layers/2):
+            self.encoder_output_layer.append(nn.Sequential(
+                nn.Dropout(p=dropout), ScaledLinear(d_model, num_classes, bias=True)
+            ))    
+        
+        
+        
 
     def run_encoder(
         self, x: Tensor, supervisions: Optional[Supervisions] = None
-    ) -> Tuple[Tensor, Optional[Tensor]]:
+    ):
         """
         Args:
           x:
@@ -127,6 +145,40 @@ class Conformer(Transformer):
             x = self.after_norm(x)
 
         return x, mask
+    
+    def forward(self, x, supervision= None, train= True):
+        if isinstance(self.use_feat_batchnorm, bool) and self.use_feat_batchnorm:
+            x = x.permute(0, 2, 1)  # (N, T, C) -> (N, C, T)
+            x = self.feat_batchnorm(x)
+            x = x.permute(0, 2, 1)  # (N, C, T) -> (N, T, C)
+        if isinstance(self.use_feat_batchnorm, float):
+            x *= self.use_feat_batchnorm
+        
+        encoder_memory, memory_key_padding_mask = self.run_encoder(x, supervision)
+        x = []
+        for i in range(0,self.num_encoder_layers/2):
+            output = self.ctc_output(encoder_memory[i],i)
+            x.append(output)
+            
+        #x = self.ctc_output(encoder_memory)
+        return x, encoder_memory, memory_key_padding_mask
+    
+    
+    def ctc_output(self, x: torch.Tensor,index) -> torch.Tensor:
+        """
+        Args:
+          x:
+            The output tensor from the transformer encoder.
+            Its shape is (T, N, C)
+
+        Returns:
+          Return a tensor that can be used for CTC decoding.
+          Its shape is (N, T, C)
+        """
+        x = self.encoder_output_layer[index](x)
+        x = x.permute(1, 0, 2)  # (T, N, C) ->(N, T, C)
+        x = nn.functional.log_softmax(x, dim=-1)  # (N, T, C)
+        return x
 
 
 class ConformerEncoderLayer(nn.Module):
@@ -321,10 +373,11 @@ class ConformerEncoder(nn.TransformerEncoder):
                 src_mask=mask,
                 src_key_padding_mask=src_key_padding_mask,
             )
+            
+            if self.norm is not None:
+                output = self.norm(output)
+            
             outputs.append(output)
-
-        if self.norm is not None:
-            output = self.norm(output)
 
         return output
 
