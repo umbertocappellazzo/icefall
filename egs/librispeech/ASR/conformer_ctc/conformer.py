@@ -19,14 +19,6 @@ import math
 import warnings
 from typing import Optional, Tuple, Union
 
-from scaling import (
-    ActivationBalancer,
-    BasicNorm,
-    DoubleSwish,
-    ScaledConv1d,
-    ScaledLinear,
-)
-
 import torch
 from torch import Tensor, nn
 from transformer import Supervisions, Transformer, encoder_padding_mask
@@ -105,9 +97,9 @@ class Conformer(Transformer):
             self.after_norm = identity
         
         self.encoder_output_layer = nn.ModuleList()
-        for i in range(0,self.num_encoder_layers/2):
+        for i in range(0,int(self.num_encoder_layers/2)):
             self.encoder_output_layer.append(nn.Sequential(
-                nn.Dropout(p=dropout), ScaledLinear(d_model, num_classes, bias=True)
+                nn.Dropout(p=dropout),nn.Linear(d_model, num_classes, bias=True)
             ))    
         
         
@@ -127,11 +119,11 @@ class Conformer(Transformer):
             frames, before subsampling
             It is read directly from the batch, without any sorting. It is used
             to compute encoder padding mask, which is used as memory key padding
-            mask for the decoder.
+            mask for the decoder. 
 
         Returns:
             Tensor: Predictor tensor of dimension (input_length, batch_size, d_model).
-            Tensor: Mask tensor of dimension (batch_size, input_length)
+            Tensor: Mask tensor of dimension (batch_size, input_length) 
         """
         x = self.encoder_embed(x)
         x, pos_emb = self.encoder_pos(x)
@@ -142,11 +134,13 @@ class Conformer(Transformer):
         x = self.encoder(x, pos_emb, src_key_padding_mask=mask)  # (T, B, F)
 
         if self.normalize_before:
-            x = self.after_norm(x)
+            
+            x = [self.after_norm(el) for el in x]
+            #x = self.after_norm(x)
 
         return x, mask
     
-    def forward(self, x, supervision= None, train= True):
+    def forward(self, x, supervision= None):
         if isinstance(self.use_feat_batchnorm, bool) and self.use_feat_batchnorm:
             x = x.permute(0, 2, 1)  # (N, T, C) -> (N, C, T)
             x = self.feat_batchnorm(x)
@@ -155,8 +149,9 @@ class Conformer(Transformer):
             x *= self.use_feat_batchnorm
         
         encoder_memory, memory_key_padding_mask = self.run_encoder(x, supervision)
+        
         x = []
-        for i in range(0,self.num_encoder_layers/2):
+        for i in range(0,int(self.num_encoder_layers/2)):
             output = self.ctc_output(encoder_memory[i],i)
             x.append(output)
             
@@ -175,6 +170,8 @@ class Conformer(Transformer):
           Return a tensor that can be used for CTC decoding.
           Its shape is (N, T, C)
         """
+        
+        
         x = self.encoder_output_layer[index](x)
         x = x.permute(1, 0, 2)  # (T, N, C) ->(N, T, C)
         x = nn.functional.log_softmax(x, dim=-1)  # (N, T, C)
@@ -244,7 +241,7 @@ class ConformerEncoderLayer(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
         self.normalize_before = normalize_before
-
+        
     def forward(
         self,
         src: Tensor,
@@ -366,7 +363,7 @@ class ConformerEncoder(nn.TransformerEncoder):
         output = src
         outputs = []
 
-        for mod in self.layers:
+        for i, mod in enumerate(self.layers):
             output = mod(
                 output,
                 pos_emb,
@@ -376,10 +373,10 @@ class ConformerEncoder(nn.TransformerEncoder):
             
             if self.norm is not None:
                 output = self.norm(output)
-            
-            outputs.append(output)
+            if (i%2) == 0:
+                outputs.append(output)
 
-        return output
+        return outputs
 
 
 class RelPositionalEncoding(torch.nn.Module):
@@ -439,7 +436,7 @@ class RelPositionalEncoding(torch.nn.Module):
 
     def forward(self, x: torch.Tensor) -> Tuple[Tensor, Tensor]:
         """Add positional encoding.
-
+b = torch
         Args:
             x (torch.Tensor): Input tensor (batch, time, `*`).
 
@@ -963,3 +960,9 @@ class Swish(torch.nn.Module):
 
 def identity(x):
     return x
+
+
+if __name__ == "__main__":
+    model = Conformer(80, 30)
+    b = torch.ones([16,128,80])
+    x1,x2,x3 = model(b)
