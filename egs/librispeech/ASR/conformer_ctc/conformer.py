@@ -312,6 +312,7 @@ class ConformerEncoder(nn.TransformerEncoder):
 
         """
         output = src
+        outputs = []
 
         for mod in self.layers:
             output = mod(
@@ -320,6 +321,7 @@ class ConformerEncoder(nn.TransformerEncoder):
                 src_mask=mask,
                 src_key_padding_mask=src_key_padding_mask,
             )
+            outputs.append(output)
 
         if self.norm is not None:
             output = self.norm(output)
