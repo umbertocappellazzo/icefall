@@ -403,20 +403,31 @@ def compute_loss(
     else:
         raise ValueError(f"Unsupported type of graph compiler: {type(graph_compiler)}")
 
-    dense_fsa_vec = k2.DenseFsaVec(
-        nnet_output,
-        supervision_segments,
-        allow_truncate=params.subsampling_factor - 1,
-    )
+    
+    ctc_loss = 0.
+    
+    for i in range(len(nnet_output)):
+        
+    
+        dense_fsa_vec = k2.DenseFsaVec(
+            nnet_output[i],
+            supervision_segments,
+            allow_truncate=params.subsampling_factor - 1,
+        )
+    
+        ctc_loss_int = k2.ctc_loss(
+            decoding_graph=decoding_graph,
+            dense_fsa_vec=dense_fsa_vec,
+            output_beam=params.beam_size,
+            reduction=params.reduction,
+            use_double_scores=params.use_double_scores,
+        )
+        
+        ctc_loss += ctc_loss_int
 
-    ctc_loss = k2.ctc_loss(
-        decoding_graph=decoding_graph,
-        dense_fsa_vec=dense_fsa_vec,
-        output_beam=params.beam_size,
-        reduction=params.reduction,
-        use_double_scores=params.use_double_scores,
-    )
-
+    
+    
+    
     if params.att_rate != 0.0:
         with torch.set_grad_enabled(is_training):
             mmodel = model.module if hasattr(model, "module") else model
