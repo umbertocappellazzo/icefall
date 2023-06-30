@@ -47,7 +47,7 @@ import torch
 import torch.multiprocessing as mp
 import torch.nn as nn
 from asr_datamodule import LibriSpeechAsrDataModule
-from conformer import Conformer
+from conformer_earlyexit import Conformer
 from lhotse.cut import Cut
 from lhotse.utils import fix_random_seed
 from torch import Tensor
