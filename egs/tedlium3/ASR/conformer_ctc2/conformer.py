@@ -110,10 +110,11 @@ class Conformer(Transformer):
 
         assert self.num_encoder_layers/2 == 0, ('Number of encoder layers must be an even number!')
         
-        self.encoder_output_layer = nn.ModuleList([nn.Sequential(
-            nn.Dropout(p=dropout), ScaledLinear(d_model, num_classes, bias=True)
-        )] for i in range(1,self.num_encoder_layers/2))
-        
+        self.encoder_output_layer = nn.ModuleList()
+        for i in range(0,self.num_encoder_layers/2):
+            self.encoder_output_layer.append(nn.Sequential(
+                nn.Dropout(p=dropout), ScaledLinear(d_model, num_classes, bias=True)
+            ))    
 
         encoder_layer = ConformerEncoderLayer(
             d_model=d_model,
