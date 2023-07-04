@@ -56,6 +56,10 @@ from icefall.mmi_graph_compiler import MmiTrainingGraphCompiler
 from icefall.utils import AttributeDict, encode_supervisions, setup_logger, str2bool
 
 
+import time
+import datetime
+
+
 def get_parser():
     parser = argparse.ArgumentParser(
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
@@ -210,7 +214,7 @@ def get_params() -> AttributeDict:
             "batch_idx_train": 0,
             "log_interval": 50,
             "reset_interval": 200,
-            "valid_interval": 300,
+            "valid_interval": 10000,
             # parameters for conformer
             "feature_dim": 80,
             "subsampling_factor": 4,
@@ -705,6 +709,9 @@ def run(rank, world_size, args):
       args:
         The return value of get_parser().parse_args()
     """
+    
+    
+    start_time = time.time()
     params = get_params()
     params.update(vars(args))
 
@@ -859,6 +866,9 @@ def run(rank, world_size, args):
         )
 
     logging.info("Done!")
+    total_time = time.time() - start_time
+    total_time_str = str(datetime.timedelta(seconds=int(total_time)))
+    print('Training time {}'.format(total_time_str))
 
     if world_size > 1:
         torch.distributed.barrier()
@@ -866,6 +876,8 @@ def run(rank, world_size, args):
 
 
 def main():
+    
+    
     parser = get_parser()
     LibriSpeechAsrDataModule.add_arguments(parser)
     args = parser.parse_args()
