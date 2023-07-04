@@ -371,6 +371,9 @@ def compute_loss(
             supervisions, subsampling_factor=params.subsampling_factor
         )
 
+        
+        
+        
         if ali is not None and params.batch_idx_train < params.use_ali_until:
             cut_ids = [cut.id for cut in supervisions["cut"]]
 
@@ -388,12 +391,16 @@ def compute_loss(
                 alignments=ali,
                 num_classes=nnet_output.shape[2],
             ).to(nnet_output)
-
-            min_len = min(nnet_output.shape[1], mask.shape[1])
-            ali_scale = 500.0 / (params.batch_idx_train + 500)
-
+            
             nnet_output = nnet_output.clone()
-            nnet_output[:, :min_len, :] += ali_scale * mask[:, :min_len, :]
+            for i in range(len(nnet_output)):
+                
+                
+                min_len = min(nnet_output[i].shape[1], mask.shape[1])
+                ali_scale = 500.0 / (params.batch_idx_train + 500)
+    
+                #nnet_output = nnet_output.clone()
+                nnet_output[i][:, :min_len, :] += ali_scale * mask[:, :min_len, :]
 
         if params.batch_idx_train > params.use_ali_until and params.beam_size < 8:
             logging.info("Change beam size to 8")
@@ -407,6 +414,7 @@ def compute_loss(
             den_scale=params.den_scale,
             beam_size=params.beam_size,
         )
+        mmi_loss = 0.
 
         dense_fsa_vec = k2.DenseFsaVec(
             nnet_output,
@@ -801,6 +809,10 @@ def run(rank, world_size, args):
 
     valid_cuts = librispeech.dev_clean_cuts()
     valid_cuts += librispeech.dev_other_cuts()
+    
+    # remove long and short utterances for validation, too.
+    valid_cuts = valid_cuts.filter(remove_short_and_long_utt)
+    
     valid_dl = librispeech.valid_dataloaders(valid_cuts)
 
     for epoch in range(params.start_epoch, params.num_epochs):

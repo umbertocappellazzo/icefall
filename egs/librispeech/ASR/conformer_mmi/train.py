@@ -793,6 +793,8 @@ def run(rank, world_size, args):
 
     valid_cuts = librispeech.dev_clean_cuts()
     valid_cuts += librispeech.dev_other_cuts()
+    # remove long and short utterances for validation, too.
+    valid_cuts = valid_cuts.filter(remove_short_and_long_utt)
     valid_dl = librispeech.valid_dataloaders(valid_cuts)
 
     for epoch in range(params.start_epoch, params.num_epochs):
