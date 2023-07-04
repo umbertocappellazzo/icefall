@@ -415,13 +415,18 @@ def compute_loss(
             beam_size=params.beam_size,
         )
         mmi_loss = 0.
-
-        dense_fsa_vec = k2.DenseFsaVec(
-            nnet_output,
-            supervision_segments,
-            allow_truncate=params.subsampling_factor - 1,
-        )
-        mmi_loss = loss_fn(dense_fsa_vec=dense_fsa_vec, texts=texts)
+        
+        for i in range(len(nnet_output)):
+            
+            # _int stands for intermediate.
+                
+            dense_fsa_vec = k2.DenseFsaVec(
+                nnet_output[i],
+                supervision_segments,
+                allow_truncate=params.subsampling_factor - 1,
+            )
+            mmi_loss_int = loss_fn(dense_fsa_vec=dense_fsa_vec, texts=texts)
+            mmi_loss += mmi_loss_int
 
     if params.att_rate != 0.0:
         token_ids = graph_compiler.texts_to_ids(supervisions["text"])
