@@ -214,7 +214,7 @@ def get_params() -> AttributeDict:
             "batch_idx_train": 0,
             "log_interval": 50,
             "reset_interval": 200,
-            "valid_interval": 10000,
+            "valid_interval": 500,
             # parameters for conformer
             "feature_dim": 80,
             "subsampling_factor": 4,
