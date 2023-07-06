@@ -382,7 +382,7 @@ class ConformerEncoder(nn.TransformerEncoder):
             
             if self.norm is not None:
                 output = self.norm(output)
-            if (i%2) == 0:
+            if ((i+1)%2) == 0:
                 outputs.append(output)
 
         return outputs
