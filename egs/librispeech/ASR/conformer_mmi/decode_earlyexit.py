@@ -27,7 +27,7 @@ import sentencepiece as spm
 import torch
 import torch.nn as nn
 from asr_datamodule import LibriSpeechAsrDataModule
-from conformer import Conformer
+from conformer_earlyexit import Conformer
 
 from icefall.bpe_graph_compiler import BpeCtcTrainingGraphCompiler
 from icefall.checkpoint import average_checkpoints, load_checkpoint
@@ -149,7 +149,7 @@ def get_parser():
     parser.add_argument(
         "--num-decoder-layers",
         type=int,
-        default=6,
+        default=0,
         help="Number of attention decoder layers",
     )
 
@@ -259,6 +259,11 @@ def decode_one_batch(
         ),
         1,
     ).to(torch.int32)
+    
+    
+    # Change this to choose which intermediate layer to use for decoding. First layer means 2nd layer, secondo means 4th etc.
+    # The last one is the last CTC layer of the network.
+    nnet_output = nnet_output[0]
 
     if H is None:
         assert HLG is not None
