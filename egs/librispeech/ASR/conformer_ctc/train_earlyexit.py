@@ -414,7 +414,7 @@ def compute_loss(
             supervision_segments,
             allow_truncate=params.subsampling_factor - 1,
         )
-    
+    # _int stands for intermediate.
         ctc_loss_int = k2.ctc_loss(
             decoding_graph=decoding_graph,
             dense_fsa_vec=dense_fsa_vec,
