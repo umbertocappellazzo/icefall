@@ -133,7 +133,7 @@ def get_parser():
     parser.add_argument(
         "--use-pruned-intersect",
         type=str2bool,
-        default=True,
+        default=False,
         help="""Whether to use `intersect_dense_pruned` to get denominator
         lattice.""",
     )
