@@ -258,7 +258,7 @@ def load_checkpoint_if_available(
     """
     if params.start_epoch <= 0:
         return
-    filename = Path('conformer_ctc/exp') / f"epoch-{params.start_epoch-1}.pt"
+    filename = Path('conformer_ctc/exp_100libri') / f"epoch-{params.start_epoch-1}.pt"
     #filename = '/cappellazzo/icefall_forked/icefall/egs/librispeech/ASR/conformer_ctc/exp'
     #filename = params.exp_dir / f"epoch-{params.start_epoch-1}.pt"
     saved_params = load_checkpoint(
