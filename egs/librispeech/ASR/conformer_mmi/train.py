@@ -85,7 +85,7 @@ def get_parser():
     parser.add_argument(
         "--start-epoch",
         type=int,
-        default=0,
+        default=5,
         help="""Resume training from from this epoch.
         If it is positive, it will load checkpoint from
         conformer_mmi/exp/epoch-{start_epoch-1}.pt
