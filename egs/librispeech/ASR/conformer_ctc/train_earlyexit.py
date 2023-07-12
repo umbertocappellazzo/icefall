@@ -253,7 +253,7 @@ def get_params() -> AttributeDict:
             "use_double_scores": True,
             # parameters for Noam
             "weight_decay": 1e-6,
-            "warm_step": 80000,
+            "warm_step": 17000,
             "env_info": get_env_info(),
         }
     )
