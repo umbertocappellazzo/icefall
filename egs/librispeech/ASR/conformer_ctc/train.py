@@ -232,7 +232,7 @@ def get_params() -> AttributeDict:
             "batch_idx_train": 0,
             "log_interval": 50,
             "reset_interval": 200,
-            "valid_interval": 3000,
+            "valid_interval": 500,
             # parameters for conformer
             "feature_dim": 80,
             "subsampling_factor": 4,
@@ -245,7 +245,7 @@ def get_params() -> AttributeDict:
             "use_double_scores": True,
             # parameters for Noam
             "weight_decay": 1e-6,
-            "warm_step": 17000,
+            "warm_step": 80000,
             "env_info": get_env_info(),
         }
     )
