@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Mon Jul  3 11:38:43 2023
+
+@author: umbertocappellazzo
+"""
+
+#!/usr/bin/env python3
 # Copyright    2021  Xiaomi Corp.        (authors: Fangjun Kuang,
 #                                                  Wei Kang)
 #
@@ -29,7 +37,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn as nn
 from asr_datamodule import LibriSpeechAsrDataModule
-from conformer import Conformer
+from conformer_earlyexit import Conformer
 from lhotse.cut import Cut
 from lhotse.dataset.sampling.base import CutSampler
 from lhotse.utils import fix_random_seed
@@ -43,11 +51,14 @@ from icefall.checkpoint import load_checkpoint
 from icefall.checkpoint import save_checkpoint as save_checkpoint_impl
 from icefall.dist import cleanup_dist, setup_dist
 from icefall.lexicon import Lexicon
-from icefall.mmi import LFMMILoss
+from icefall.mmi_check import LFMMILoss
 from icefall.mmi_graph_compiler import MmiTrainingGraphCompiler
 from icefall.utils import AttributeDict, encode_supervisions, setup_logger, str2bool
+
+
 import time
 import datetime
+
 
 def get_parser():
     parser = argparse.ArgumentParser(
@@ -203,7 +214,7 @@ def get_params() -> AttributeDict:
             "batch_idx_train": 0,
             "log_interval": 50,
             "reset_interval": 200,
-            "valid_interval": 500,
+            "valid_interval": 300,
             # parameters for conformer
             "feature_dim": 80,
             "subsampling_factor": 4,
@@ -258,8 +269,8 @@ def load_checkpoint_if_available(
     """
     if params.start_epoch <= 0:
         return
-    filename = Path('conformer_ctc/exp_100libri') / f"epoch-{params.start_epoch-1}.pt"
-    #filename = '/cappellazzo/icefall_forked/icefall/egs/librispeech/ASR/conformer_ctc/exp'
+    filename = Path('conformer_ctc/exp_EE') / f"epoch-{params.start_epoch-1}.pt"
+    #filename = '/cappellazzo/icefall_forked/icefall/egs/librispeech/ASR/conformer_ctc/exp_EE'
     #filename = params.exp_dir / f"epoch-{params.start_epoch-1}.pt"
     saved_params = load_checkpoint(
         filename,
@@ -365,6 +376,9 @@ def compute_loss(
             supervisions, subsampling_factor=params.subsampling_factor
         )
 
+        
+        
+        
         if ali is not None and params.batch_idx_train < params.use_ali_until:
             cut_ids = [cut.id for cut in supervisions["cut"]]
 
@@ -382,12 +396,16 @@ def compute_loss(
                 alignments=ali,
                 num_classes=nnet_output.shape[2],
             ).to(nnet_output)
-
-            min_len = min(nnet_output.shape[1], mask.shape[1])
-            ali_scale = 500.0 / (params.batch_idx_train + 500)
-
+            
             nnet_output = nnet_output.clone()
-            nnet_output[:, :min_len, :] += ali_scale * mask[:, :min_len, :]
+            for i in range(len(nnet_output)):
+                
+                
+                min_len = min(nnet_output[i].shape[1], mask.shape[1])
+                ali_scale = 500.0 / (params.batch_idx_train + 500)
+    
+                #nnet_output = nnet_output.clone()
+                nnet_output[i][:, :min_len, :] += ali_scale * mask[:, :min_len, :]
 
         if params.batch_idx_train > params.use_ali_until and params.beam_size < 8:
             #logging.info("Change beam size to 8")
@@ -401,13 +419,19 @@ def compute_loss(
             den_scale=params.den_scale,
             beam_size=params.beam_size,
         )
-
-        dense_fsa_vec = k2.DenseFsaVec(
-            nnet_output,
-            supervision_segments,
-            allow_truncate=params.subsampling_factor - 1,
-        )
-        mmi_loss = loss_fn(dense_fsa_vec=dense_fsa_vec, texts=texts)
+        mmi_loss = 0.
+        
+        for i in range(len(nnet_output)):
+            
+            # _int stands for intermediate.
+                
+            dense_fsa_vec = k2.DenseFsaVec(
+                nnet_output[i],
+                supervision_segments,
+                allow_truncate=params.subsampling_factor - 1,
+            )
+            mmi_loss_int = loss_fn(dense_fsa_vec=dense_fsa_vec, texts=texts)
+            mmi_loss += mmi_loss_int
 
     if params.att_rate != 0.0:
         token_ids = graph_compiler.texts_to_ids(supervisions["text"])
@@ -686,8 +710,9 @@ def run(rank, world_size, args):
       args:
         The return value of get_parser().parse_args()
     """
+    
+    
     start_time = time.time()
-
     params = get_params()
     params.update(vars(args))
 
@@ -797,8 +822,10 @@ def run(rank, world_size, args):
 
     valid_cuts = librispeech.dev_clean_cuts()
     valid_cuts += librispeech.dev_other_cuts()
+    
     # remove long and short utterances for validation, too.
     valid_cuts = valid_cuts.filter(remove_short_and_long_utt)
+    
     valid_dl = librispeech.valid_dataloaders(valid_cuts)
 
     for epoch in range(params.start_epoch, params.num_epochs):
@@ -850,6 +877,8 @@ def run(rank, world_size, args):
 
 
 def main():
+    
+    
     parser = get_parser()
     LibriSpeechAsrDataModule.add_arguments(parser)
     args = parser.parse_args()

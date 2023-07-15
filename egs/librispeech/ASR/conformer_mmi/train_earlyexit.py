@@ -214,7 +214,7 @@ def get_params() -> AttributeDict:
             "batch_idx_train": 0,
             "log_interval": 50,
             "reset_interval": 200,
-            "valid_interval": 500,
+            "valid_interval": 300,
             # parameters for conformer
             "feature_dim": 80,
             "subsampling_factor": 4,
@@ -408,7 +408,7 @@ def compute_loss(
                 nnet_output[i][:, :min_len, :] += ali_scale * mask[:, :min_len, :]
 
         if params.batch_idx_train > params.use_ali_until and params.beam_size < 8:
-            logging.info("Change beam size to 8")
+            #logging.info("Change beam size to 8")
             params.beam_size = 8
         else:
             params.beam_size = 6
@@ -827,6 +827,11 @@ def run(rank, world_size, args):
     valid_cuts = valid_cuts.filter(remove_short_and_long_utt)
     
     valid_dl = librispeech.valid_dataloaders(valid_cuts)
+    
+    for batch_idx, batch in enumerate(valid_dl):
+        print(len(batch))
+    
+    print("total len valid: ", batch_idx)
 
     for epoch in range(params.start_epoch, params.num_epochs):
         fix_random_seed(params.seed + epoch)
