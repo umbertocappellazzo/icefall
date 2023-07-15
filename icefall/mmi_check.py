@@ -161,7 +161,11 @@ def _compute_mmi_loss_exact_non_optimized(
     tot_scores = num_tot_scores - den_scale * den_tot_scores
 
     loss = -1 * tot_scores.sum()
-    return loss
+    return -1*num_tot_scores.sum(), -1*den_tot_scores.sum(),loss
+
+    # returns den and num as well.
+
+
 
 def _compute_mmi_loss_pruned(
     dense_fsa_vec: k2.DenseFsaVec,
