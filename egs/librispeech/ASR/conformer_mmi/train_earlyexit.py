@@ -828,11 +828,7 @@ def run(rank, world_size, args):
     
     valid_dl = librispeech.valid_dataloaders(valid_cuts)
     
-    for batch_idx, batch in enumerate(valid_dl):
-        print(len(batch))
     
-    print("total len valid: ", batch_idx)
-
     for epoch in range(params.start_epoch, params.num_epochs):
         fix_random_seed(params.seed + epoch)
         train_dl.sampler.set_epoch(epoch)

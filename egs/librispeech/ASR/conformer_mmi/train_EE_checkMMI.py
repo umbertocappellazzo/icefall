@@ -230,7 +230,7 @@ def get_params() -> AttributeDict:
             # parameters for Noam
             "weight_decay": 1e-6,
             "lr_factor": 5.0,
-            "warm_step": 0,
+            "warm_step": 80000,
             "den_scale": 1.0,
             # use alignments before this number of batches
             "use_ali_until": 13000,
@@ -328,7 +328,8 @@ def save_checkpoint(
         copyfile(src=filename, dst=best_valid_filename)
 
 
-def compute_loss(
+
+def compute_loss_oneutt(
     params: AttributeDict,
     model: nn.Module,
     batch: dict,
@@ -359,12 +360,12 @@ def compute_loss(
         Precomputed alignments.
     """
     device = graph_compiler.device
-    feature = batch["inputs"]
+    feature = batch["inputs"][0]
     # at entry, feature is (N, T, C)
     assert feature.ndim == 3
     feature = feature.to(device)
 
-    supervisions = batch["supervisions"]
+    supervisions = batch["supervisions"][0]
     with torch.set_grad_enabled(is_training):
         nnet_output, encoder_memory, memory_mask = model(feature, supervisions)
         # nnet_output is (N, T, C)
@@ -460,6 +461,145 @@ def compute_loss(
     return loss, mmi_loss.detach(), att_loss.detach()
 
 
+
+def compute_loss(
+    params: AttributeDict,
+    model: nn.Module,
+    batch: dict,
+    graph_compiler: MmiTrainingGraphCompiler,
+    is_training: bool,
+    ali: Optional[Dict[str, torch.Tensor]],
+):
+    """
+    Compute LF-MMI loss given the model and its inputs.
+
+    Args:
+      params:
+        Parameters for training. See :func:`get_params`.
+      model:
+        The model for training. It is an instance of Conformer in our case.
+      batch:
+        A batch of data. See `lhotse.dataset.K2SpeechRecognitionDataset()`
+        for the content in it.
+      graph_compiler:
+        It is used to build a decoding graph from a ctc topo and training
+        transcript. The training transcript is contained in the given `batch`,
+        while the ctc topo is built when this compiler is instantiated.
+      is_training:
+        True for training. False for validation. When it is True, this
+        function enables autograd during computation; when it is False, it
+        disables autograd.
+      ali:
+        Precomputed alignments.
+    """
+    device = graph_compiler.device
+    feature = batch["inputs"]
+    # at entry, feature is (N, T, C)
+    assert feature.ndim == 3
+    feature = feature.to(device)
+
+    supervisions = batch["supervisions"]
+    with torch.set_grad_enabled(is_training):
+        nnet_output, encoder_memory, memory_mask = model(feature, supervisions)
+        # nnet_output is (N, T, C)
+
+        # NOTE: We need `encode_supervisions` to sort sequences with
+        # different duration in decreasing order, required by
+        # `k2.intersect_dense` called in `LFMMILoss.forward()`
+        supervision_segments, texts = encode_supervisions(
+            supervisions, subsampling_factor=params.subsampling_factor
+        )
+
+        
+        
+        
+        if ali is not None and params.batch_idx_train < params.use_ali_until:
+            cut_ids = [cut.id for cut in supervisions["cut"]]
+
+            # As encode_supervisions reorders cuts, we need
+            # also to reorder cut IDs here
+            new2old = supervision_segments[:, 0].tolist()
+            cut_ids = [cut_ids[i] for i in new2old]
+
+            # Check that new2old is just a permutation,
+            # i.e., each cut contains only one utterance
+            new2old.sort()
+            assert new2old == torch.arange(len(new2old)).tolist()
+            mask = lookup_alignments(
+                cut_ids=cut_ids,
+                alignments=ali,
+                num_classes=nnet_output.shape[2],
+            ).to(nnet_output)
+            
+            nnet_output = nnet_output.clone()
+            for i in range(len(nnet_output)):
+                
+                
+                min_len = min(nnet_output[i].shape[1], mask.shape[1])
+                ali_scale = 500.0 / (params.batch_idx_train + 500)
+    
+                #nnet_output = nnet_output.clone()
+                nnet_output[i][:, :min_len, :] += ali_scale * mask[:, :min_len, :]
+
+        if params.batch_idx_train > params.use_ali_until and params.beam_size < 8:
+            #logging.info("Change beam size to 8")
+            params.beam_size = 8
+        else:
+            params.beam_size = 6
+
+        loss_fn = LFMMILoss(
+            graph_compiler=graph_compiler,
+            use_pruned_intersect=params.use_pruned_intersect,
+            den_scale=params.den_scale,
+            beam_size=params.beam_size,
+        )
+        mmi_loss = 0.
+        
+        num_list = []
+        den_list = []
+        
+        for i in range(len(nnet_output)):
+            
+            # _int stands for intermediate.
+                
+            dense_fsa_vec = k2.DenseFsaVec(
+                nnet_output[i],
+                supervision_segments,
+                allow_truncate=params.subsampling_factor - 1,
+            )
+            loss_num, loss_den, mmi_loss_int = loss_fn(dense_fsa_vec=dense_fsa_vec, texts=texts)
+            mmi_loss += mmi_loss_int
+            
+            num_list.append(loss_num)
+            den_list.append(loss_den)
+
+    if params.att_rate != 0.0:
+        token_ids = graph_compiler.texts_to_ids(supervisions["text"])
+        with torch.set_grad_enabled(is_training):
+            mmodel = model.module if hasattr(model, "module") else model
+            att_loss = mmodel.decoder_forward(
+                encoder_memory,
+                memory_mask,
+                token_ids=token_ids,
+                sos_id=graph_compiler.sos_id,
+                eos_id=graph_compiler.eos_id,
+            )
+        loss = (1.0 - params.att_rate) * mmi_loss + params.att_rate * att_loss
+    else:
+        loss = mmi_loss
+        att_loss = torch.tensor([0])
+
+    # train_frames and valid_frames are used for printing.
+    if is_training:
+        params.train_frames = supervision_segments[:, 2].sum().item()
+    else:
+        params.valid_frames = supervision_segments[:, 2].sum().item()
+
+    assert loss.requires_grad == is_training
+
+    return num_list, den_list, loss, mmi_loss.detach(), att_loss.detach()
+
+
 def compute_validation_loss(
     params: AttributeDict,
     model: nn.Module,
@@ -477,8 +617,14 @@ def compute_validation_loss(
     tot_mmi_loss = 0.0
     tot_att_loss = 0.0
     tot_frames = 0.0
+    
+    
+    num_0 = num_1 = num_2 = num_3 = num_4 = num_5 = den_0 = den_1 = den_2 = den_3 = den_4 = den_5 = 0.
+    
+    
     for batch_idx, batch in enumerate(valid_dl):
-        loss, mmi_loss, att_loss = compute_loss(
+        
+        num_list, den_list, loss, mmi_loss, att_loss = compute_loss(
             params=params,
             model=model,
             batch=batch,
@@ -489,7 +635,13 @@ def compute_validation_loss(
         assert loss.requires_grad is False
         assert mmi_loss.requires_grad is False
         assert att_loss.requires_grad is False
-
+        
+        num_0 += num_list[0].detach().cpu().item(); num_1 += num_list[1].detach().cpu().item(); num_2 += num_list[2].detach().cpu().item()
+        num_3 += num_list[3].detach().cpu().item(); num_4 += num_list[4].detach().cpu().item(); num_5 += num_list[5].detach().cpu().item()
+        
+        den_0 += den_list[0].detach().cpu().item(); den_1 += den_list[1].detach().cpu().item(); den_2 += den_list[2].detach().cpu().item()
+        den_3 += den_list[3].detach().cpu().item(); den_4 += den_list[4].detach().cpu().item(); den_5 += den_list[5].detach().cpu().item()
+        
         loss_cpu = loss.detach().cpu().item()
         tot_loss += loss_cpu
 
@@ -500,8 +652,8 @@ def compute_validation_loss(
 
     if world_size > 1:
         s = torch.tensor(
-            [tot_loss, tot_mmi_loss, tot_att_loss, tot_frames],
-            device=loss.device,
+            [tot_loss, tot_mmi_loss, tot_att_loss, tot_frames, num_0, num_1, num_2, num_3, num_4, num_5, den_0, den_1, den_2, den_3, den_4, den_5],
+            device=loss.device
         )
         dist.all_reduce(s, op=dist.ReduceOp.SUM)
         s = s.cpu().tolist()
@@ -509,7 +661,12 @@ def compute_validation_loss(
         tot_mmi_loss = s[1]
         tot_att_loss = s[2]
         tot_frames = s[3]
+        
+        num_0 = s[4]; num_1 = s[5]; num_2 = s[6]; num_3 = s[7]; num_4 = s[8]; num_5 = s[9]; den_0 = s[10]; den_1 = s[11]; den_2 = s[12]; den_3 = s[13]; den_4 = s[14]; den_5 = s[15];
 
+    params.val_loss_num_0 = num_0 / tot_frames; params.val_loss_num_1 = num_1 / tot_frames; params.val_loss_num_2 = num_2 / tot_frames; params.val_loss_num_3 = num_3 / tot_frames; params.val_loss_num_4 = num_4 / tot_frames; params.val_loss_num_5 = num_5 / tot_frames;   
+    params.val_loss_den_0 = den_0 / tot_frames; params.val_loss_den_1 = den_1 / tot_frames; params.val_loss_den_2 = den_2 / tot_frames; params.val_loss_den_3 = den_3 / tot_frames; params.val_loss_den_4 = den_4 / tot_frames; params.val_loss_den_5 = den_5 / tot_frames;
+    
     params.valid_loss = tot_loss / tot_frames
     params.valid_mmi_loss = tot_mmi_loss / tot_frames
     params.valid_att_loss = tot_att_loss / tot_frames
@@ -564,6 +721,9 @@ def train_one_epoch(
     tot_loss = 0.0  # sum of losses over all batches
     tot_mmi_loss = 0.0
     tot_att_loss = 0.0
+    
+    
+    num_0_t = num_1_t = num_2_t = num_3_t = num_4_t = num_5_t = den_0_t = den_1_t = den_2_t = den_3_t = den_4_t = den_5_t = 0.
 
     tot_frames = 0.0  # sum of frames over all batches
     params.tot_loss = 0.0
@@ -572,7 +732,7 @@ def train_one_epoch(
         params.batch_idx_train += 1
         batch_size = len(batch["supervisions"]["text"])
 
-        loss, mmi_loss, att_loss = compute_loss(
+        num_list_t, den_list_t, loss, mmi_loss, att_loss = compute_loss(
             params=params,
             model=model,
             batch=batch,
@@ -592,6 +752,17 @@ def train_one_epoch(
         loss_cpu = loss.detach().cpu().item()
         mmi_loss_cpu = mmi_loss.detach().cpu().item()
         att_loss_cpu = att_loss.detach().cpu().item()
+        
+        
+        num_0_t += num_list_t[0].detach().cpu().item(); num_1_t += num_list_t[1].detach().cpu().item(); num_2_t += num_list_t[2].detach().cpu().item()
+        num_3_t += num_list_t[3].detach().cpu().item(); num_4_t += num_list_t[4].detach().cpu().item(); num_5_t += num_list_t[5].detach().cpu().item()
+        
+        den_0_t += den_list_t[0].detach().cpu().item(); den_1_t += den_list_t[1].detach().cpu().item(); den_2_t += den_list_t[2].detach().cpu().item()
+        den_3_t += den_list_t[3].detach().cpu().item(); den_4_t += den_list_t[4].detach().cpu().item(); den_5_t += den_list_t[5].detach().cpu().item()
+        
+        
+        loss_cpu = loss.detach().cpu().item()
+        
 
         tot_frames += params.train_frames
         tot_loss += loss_cpu
@@ -604,6 +775,12 @@ def train_one_epoch(
         tot_avg_loss = tot_loss / tot_frames
         tot_avg_mmi_loss = tot_mmi_loss / tot_frames
         tot_avg_att_loss = tot_att_loss / tot_frames
+        
+        
+        
+        params.train_loss_den_0 = den_0_t / tot_frames; params.train_loss_den_1 = den_1_t / tot_frames; params.train_loss_den_2 = den_2_t / tot_frames; params.train_loss_den_3 = den_3_t / tot_frames; params.train_loss_den_4 = den_4_t / tot_frames; params.train_loss_den_5 = den_5_t / tot_frames;   
+        params.train_loss_num_0 = num_0_t / tot_frames; params.train_loss_num_1 = num_1_t / tot_frames; params.train_loss_num_2 = num_2_t / tot_frames; params.train_loss_num_3 = num_3_t / tot_frames; params.train_loss_num_4 = num_4_t / tot_frames; params.train_loss_num_5 = num_5_t / tot_frames;
+        
 
         if batch_idx % params.log_interval == 0:
             logging.info(
@@ -649,6 +826,70 @@ def train_one_epoch(
                     tot_avg_loss,
                     params.batch_idx_train,
                 )
+                tb_writer.add_scalar(
+                    "train/train_loss_num_0",
+                    params.train_loss_num_0,
+                    params.batch_idx_train,
+                )
+                tb_writer.add_scalar(
+                    "train/train_loss_num_1",
+                    params.train_loss_num_1,
+                    params.batch_idx_train,
+                )
+                tb_writer.add_scalar(
+                    "train/train_loss_num_2",
+                    params.train_loss_num_2,
+                    params.batch_idx_train,
+                )
+                tb_writer.add_scalar(
+                    "train/train_loss_num_3",
+                    params.train_loss_num_3,
+                    params.batch_idx_train,
+                )
+                tb_writer.add_scalar(
+                    "train/train_loss_num_4",
+                    params.train_loss_num_4,
+                    params.batch_idx_train,
+                )
+                tb_writer.add_scalar(
+                    "train/train_loss_num_5",
+                    params.train_loss_num_5,
+                    params.batch_idx_train,
+                )
+                tb_writer.add_scalar(
+                    "train/train_loss_den_0",
+                    params.train_loss_den_0,
+                    params.batch_idx_train,
+                )
+                tb_writer.add_scalar(
+                    "train/train_loss_den_1",
+                    params.train_loss_den_1,
+                    params.batch_idx_train,
+                )
+                tb_writer.add_scalar(
+                    "train/train_loss_den_2",
+                    params.train_loss_den_2,
+                    params.batch_idx_train,
+                )
+                tb_writer.add_scalar(
+                    "train/train_loss_den_3",
+                    params.train_loss_den_3,
+                    params.batch_idx_train,
+                )
+                tb_writer.add_scalar(
+                    "train/train_loss_den_4",
+                    params.train_loss_den_4,
+                    params.batch_idx_train,
+                )
+                tb_writer.add_scalar(
+                    "train/train_loss_den_5",
+                    params.train_loss_den_5,
+                    params.batch_idx_train,
+                )
+
+                
+                
+                
         if batch_idx > 0 and batch_idx % params.reset_interval == 0:
             tot_loss = 0.0  # sum of losses over all batches
             tot_mmi_loss = 0.0
@@ -688,6 +929,66 @@ def train_one_epoch(
                 tb_writer.add_scalar(
                     "train/valid_loss",
                     params.valid_loss,
+                    params.batch_idx_train,
+                )
+                tb_writer.add_scalar(
+                    "train/val_loss_num_0",
+                    params.val_loss_num_0,
+                    params.batch_idx_train,
+                )
+                tb_writer.add_scalar(
+                    "train/val_loss_num_1",
+                    params.val_loss_num_1,
+                    params.batch_idx_train,
+                )
+                tb_writer.add_scalar(
+                    "train/val_loss_num_2",
+                    params.val_loss_num_2,
+                    params.batch_idx_train,
+                )
+                tb_writer.add_scalar(
+                    "train/val_loss_num_3",
+                    params.val_loss_num_3,
+                    params.batch_idx_train,
+                )
+                tb_writer.add_scalar(
+                    "train/val_loss_num_4",
+                    params.val_loss_num_4,
+                    params.batch_idx_train,
+                )
+                tb_writer.add_scalar(
+                    "train/val_loss_num_5",
+                    params.val_loss_num_5,
+                    params.batch_idx_train,
+                )
+                tb_writer.add_scalar(
+                    "train/val_loss_den_0",
+                    params.val_loss_den_0,
+                    params.batch_idx_train,
+                )
+                tb_writer.add_scalar(
+                    "train/val_loss_den_1",
+                    params.val_loss_den_1,
+                    params.batch_idx_train,
+                )
+                tb_writer.add_scalar(
+                    "train/val_loss_den_2",
+                    params.val_loss_den_2,
+                    params.batch_idx_train,
+                )
+                tb_writer.add_scalar(
+                    "train/val_loss_den_3",
+                    params.val_loss_den_3,
+                    params.batch_idx_train,
+                )
+                tb_writer.add_scalar(
+                    "train/val_loss_den_4",
+                    params.val_loss_den_4,
+                    params.batch_idx_train,
+                )
+                tb_writer.add_scalar(
+                    "train/val_loss_den_5",
+                    params.val_loss_den_5,
                     params.batch_idx_train,
                 )
 
@@ -827,6 +1128,17 @@ def run(rank, world_size, args):
     valid_cuts = valid_cuts.filter(remove_short_and_long_utt)
     
     valid_dl = librispeech.valid_dataloaders(valid_cuts)
+    
+    
+    # with open ('log_utterances.txt', 'w') as file:  
+    #     for batch_idx, batch in enumerate(valid_dl):
+    #         file.write(batch['supervisions']['text'][0])
+    #         file.write('\n')
+        
+    #     file.write('\n \n')
+        
+            
+    
 
     for epoch in range(params.start_epoch, params.num_epochs):
         fix_random_seed(params.seed + epoch)
