@@ -219,7 +219,7 @@ def get_params() -> AttributeDict:
             # parameters for Noam
             "weight_decay": 1e-6,
             "lr_factor": 5.0,
-            "warm_step": 0,
+            "warm_step": 80000,
             "den_scale": 1.0,
             # use alignments before this number of batches
             "use_ali_until": 13000,
