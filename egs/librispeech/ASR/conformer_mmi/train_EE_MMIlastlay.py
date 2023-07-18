@@ -337,138 +337,6 @@ def save_checkpoint(
 
 
 
-def compute_loss_oneutt(
-    params: AttributeDict,
-    model: nn.Module,
-    batch: dict,
-    graph_compiler: MmiTrainingGraphCompiler,
-    is_training: bool,
-    ali: Optional[Dict[str, torch.Tensor]],
-):
-    """
-    Compute LF-MMI loss given the model and its inputs.
-
-    Args:
-      params:
-        Parameters for training. See :func:`get_params`.
-      model:
-        The model for training. It is an instance of Conformer in our case.
-      batch:
-        A batch of data. See `lhotse.dataset.K2SpeechRecognitionDataset()`
-        for the content in it.
-      graph_compiler:
-        It is used to build a decoding graph from a ctc topo and training
-        transcript. The training transcript is contained in the given `batch`,
-        while the ctc topo is built when this compiler is instantiated.
-      is_training:
-        True for training. False for validation. When it is True, this
-        function enables autograd during computation; when it is False, it
-        disables autograd.
-      ali:
-        Precomputed alignments.
-    """
-    device = graph_compiler.device
-    feature = batch["inputs"][0]
-    # at entry, feature is (N, T, C)
-    assert feature.ndim == 3
-    feature = feature.to(device)
-
-    supervisions = batch["supervisions"][0]
-    with torch.set_grad_enabled(is_training):
-        nnet_output, encoder_memory, memory_mask = model(feature, supervisions)
-        # nnet_output is (N, T, C)
-
-        # NOTE: We need `encode_supervisions` to sort sequences with
-        # different duration in decreasing order, required by
-        # `k2.intersect_dense` called in `LFMMILoss.forward()`
-        supervision_segments, texts = encode_supervisions(
-            supervisions, subsampling_factor=params.subsampling_factor
-        )
-
-        
-        
-        
-        if ali is not None and params.batch_idx_train < params.use_ali_until:
-            cut_ids = [cut.id for cut in supervisions["cut"]]
-
-            # As encode_supervisions reorders cuts, we need
-            # also to reorder cut IDs here
-            new2old = supervision_segments[:, 0].tolist()
-            cut_ids = [cut_ids[i] for i in new2old]
-
-            # Check that new2old is just a permutation,
-            # i.e., each cut contains only one utterance
-            new2old.sort()
-            assert new2old == torch.arange(len(new2old)).tolist()
-            mask = lookup_alignments(
-                cut_ids=cut_ids,
-                alignments=ali,
-                num_classes=nnet_output.shape[2],
-            ).to(nnet_output)
-            
-            nnet_output = nnet_output.clone()
-            for i in range(len(nnet_output)):
-                
-                
-                min_len = min(nnet_output[i].shape[1], mask.shape[1])
-                ali_scale = 500.0 / (params.batch_idx_train + 500)
-    
-                #nnet_output = nnet_output.clone()
-                nnet_output[i][:, :min_len, :] += ali_scale * mask[:, :min_len, :]
-
-        if params.batch_idx_train > params.use_ali_until and params.beam_size < 8:
-            #logging.info("Change beam size to 8")
-            params.beam_size = 8
-        else:
-            params.beam_size = 6
-
-        loss_fn = LFMMILoss(
-            graph_compiler=graph_compiler,
-            use_pruned_intersect=params.use_pruned_intersect,
-            den_scale=params.den_scale,
-            beam_size=params.beam_size,
-        )
-        mmi_loss = 0.
-        
-        for i in range(len(nnet_output)):
-            
-            # _int stands for intermediate.
-                
-            dense_fsa_vec = k2.DenseFsaVec(
-                nnet_output[i],
-                supervision_segments,
-                allow_truncate=params.subsampling_factor - 1,
-            )
-            mmi_loss_int = loss_fn(dense_fsa_vec=dense_fsa_vec, texts=texts)
-            mmi_loss += mmi_loss_int
-
-    if params.att_rate != 0.0:
-        token_ids = graph_compiler.texts_to_ids(supervisions["text"])
-        with torch.set_grad_enabled(is_training):
-            mmodel = model.module if hasattr(model, "module") else model
-            att_loss = mmodel.decoder_forward(
-                encoder_memory,
-                memory_mask,
-                token_ids=token_ids,
-                sos_id=graph_compiler.sos_id,
-                eos_id=graph_compiler.eos_id,
-            )
-        loss = (1.0 - params.att_rate) * mmi_loss + params.att_rate * att_loss
-    else:
-        loss = mmi_loss
-        att_loss = torch.tensor([0])
-
-    # train_frames and valid_frames are used for printing.
-    if is_training:
-        params.train_frames = supervision_segments[:, 2].sum().item()
-    else:
-        params.valid_frames = supervision_segments[:, 2].sum().item()
-
-    assert loss.requires_grad == is_training
-
-    return loss, mmi_loss.detach(), att_loss.detach()
-
-
 
 def compute_loss(
     params: AttributeDict,
@@ -574,7 +442,7 @@ def compute_loss(
                 supervision_segments,
                 allow_truncate=params.subsampling_factor - 1,
             )
-            mmi_loss_int = loss_fn(dense_fsa_vec=dense_fsa_vec, texts=texts, is_last_layer=True)*6 if i == (len(nnet_output)-1) else loss_fn(dense_fsa_vec=dense_fsa_vec, texts=texts,) 
+            mmi_loss_int = loss_fn(dense_fsa_vec=dense_fsa_vec, texts=texts, is_last_layer=True) if i == (len(nnet_output)-1) else loss_fn(dense_fsa_vec=dense_fsa_vec, texts=texts,) 
             mmi_loss += mmi_loss_int
             
             losses_list.append(mmi_loss_int)
