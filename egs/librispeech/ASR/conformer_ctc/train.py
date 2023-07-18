@@ -664,7 +664,7 @@ def run(rank, world_size, args):
         num_classes=num_classes,
         subsampling_factor=params.subsampling_factor,
         num_decoder_layers=params.num_decoder_layers,
-        num_encoder_layers=2,
+        num_encoder_layers=6,
         vgg_frontend=False,
         use_feat_batchnorm=params.use_feat_batchnorm,
     )
