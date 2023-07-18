@@ -134,6 +134,7 @@ def _compute_mmi_loss_exact_non_optimized(
     graph_compiler: MmiTrainingGraphCompiler,
     den_scale: float = 1.0,
     beam_size: float = 8.0,
+    is_last_layer = False,
 ) -> torch.Tensor:
     """
     See :func:`_compute_mmi_loss_exact_optimized` for the meaning
@@ -144,26 +145,49 @@ def _compute_mmi_loss_exact_non_optimized(
     Note:
       It uses less memory at the cost of speed. It is slower.
     """
-    num_graphs, den_graphs = graph_compiler.compile(texts, replicate_den=True)
+    
+    if is_last_layer:
+        num_graphs, den_graphs = graph_compiler.compile(texts, replicate_den=True)
 
-    # TODO: pass output_beam as function argument
-    num_lats = k2.intersect_dense(
-        num_graphs, dense_fsa_vec, output_beam=beam_size, max_arcs=2147483600
-    )
-    den_lats = k2.intersect_dense(
-        den_graphs, dense_fsa_vec, output_beam=beam_size, max_arcs=2147483600
-    )
+        # TODO: pass output_beam as function argument
+        num_lats = k2.intersect_dense(
+            num_graphs, dense_fsa_vec, output_beam=beam_size, max_arcs=2147483600
+        )
+        den_lats = k2.intersect_dense(
+            den_graphs, dense_fsa_vec, output_beam=beam_size, max_arcs=2147483600
+        )
 
-    num_tot_scores = num_lats.get_tot_scores(log_semiring=True, use_double_scores=True)
+        num_tot_scores = num_lats.get_tot_scores(log_semiring=True, use_double_scores=True)
 
-    den_tot_scores = den_lats.get_tot_scores(log_semiring=True, use_double_scores=True)
+        den_tot_scores = den_lats.get_tot_scores(log_semiring=True, use_double_scores=True)
 
-    tot_scores = num_tot_scores - den_scale * den_tot_scores
+        tot_scores = num_tot_scores - den_scale * den_tot_scores
 
-    loss = -1 * tot_scores.sum()
-    return -1*num_tot_scores.sum(), -1*den_tot_scores.sum(),loss
+        loss = -1 * tot_scores.sum()
+        return loss
+    else:
 
-    # returns den and num as well.
+        num_graphs, den_graphs = graph_compiler.compile(texts, replicate_den=True)
+
+        # TODO: pass output_beam as function argument
+        num_lats = k2.intersect_dense(
+            num_graphs, dense_fsa_vec, output_beam=beam_size, max_arcs=2147483600
+        )
+        #den_lats = k2.intersect_dense(
+        #    den_graphs, dense_fsa_vec, output_beam=beam_size, max_arcs=2147483600
+        #)
+
+        num_tot_scores = num_lats.get_tot_scores(log_semiring=True, use_double_scores=True)
+
+        #den_tot_scores = den_lats.get_tot_scores(log_semiring=True, use_double_scores=True)
+
+        tot_scores = num_tot_scores #- den_scale * den_tot_scores
+
+        loss = -1 * tot_scores.sum()
+        return loss
+        #return -1*num_tot_scores.sum(), -1*den_tot_scores.sum(),loss
+
+        # returns den and num as well.
 
 
 
@@ -233,6 +257,7 @@ class LFMMILoss(nn.Module):
         self,
         dense_fsa_vec: k2.DenseFsaVec,
         texts: List[str],
+        is_last_layer = False,
     ) -> torch.Tensor:
         """
         Args:
@@ -256,4 +281,5 @@ class LFMMILoss(nn.Module):
             graph_compiler=self.graph_compiler,
             den_scale=self.den_scale,
             beam_size=self.beam_size,
+            is_last_layer = is_last_layer
         )
