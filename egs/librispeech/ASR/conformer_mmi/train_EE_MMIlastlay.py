@@ -220,9 +220,9 @@ def get_params() -> AttributeDict:
             "best_train_epoch": -1,
             "best_valid_epoch": -1,
             "batch_idx_train": 0,
-            "log_interval": 50,
+            "log_interval": 30,
             "reset_interval": 200,
-            "valid_interval": 300,
+            "valid_interval": 100,
             # parameters for conformer
             "feature_dim": 80,
             "subsampling_factor": 4,
