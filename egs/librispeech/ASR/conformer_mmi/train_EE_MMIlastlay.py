@@ -443,7 +443,7 @@ def compute_loss(
                 allow_truncate=params.subsampling_factor - 1,
             )
             #mmi_loss_int = loss_fn(dense_fsa_vec=dense_fsa_vec, texts=texts, is_last_layer=True) if i == (len(nnet_output)-1) else loss_fn(dense_fsa_vec=dense_fsa_vec, texts=texts,) 
-            mmi_loss_int = loss_fn(dense_fsa_vec=dense_fsa_vec, texts=texts,)
+            mmi_loss_int = loss_fn(dense_fsa_vec=dense_fsa_vec, texts=texts,is_last_layer=True)
             mmi_loss += mmi_loss_int
             
             losses_list.append(mmi_loss_int)

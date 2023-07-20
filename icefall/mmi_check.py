@@ -93,40 +93,40 @@ def _compute_mmi_loss_exact_optimized(
     return loss
 
 
-def _compute_mmi_loss_exact_non_optimized(
-    dense_fsa_vec: k2.DenseFsaVec,
-    texts: List[str],
-    graph_compiler: MmiTrainingGraphCompiler,
-    den_scale: float = 1.0,
-    beam_size: float = 8.0,
-) -> torch.Tensor:
-    """
-    See :func:`_compute_mmi_loss_exact_optimized` for the meaning
-    of the arguments.
+# def _compute_mmi_loss_exact_non_optimized(
+#     dense_fsa_vec: k2.DenseFsaVec,
+#     texts: List[str],
+#     graph_compiler: MmiTrainingGraphCompiler,
+#     den_scale: float = 1.0,
+#     beam_size: float = 8.0,
+# ) -> torch.Tensor:
+#     """
+#     See :func:`_compute_mmi_loss_exact_optimized` for the meaning
+#     of the arguments.
 
-    It's more readable, though it invokes k2.intersect_dense twice.
+#     It's more readable, though it invokes k2.intersect_dense twice.
 
-    Note:
-      It uses less memory at the cost of speed. It is slower.
-    """
-    num_graphs, den_graphs = graph_compiler.compile(texts, replicate_den=True)
+#     Note:
+#       It uses less memory at the cost of speed. It is slower.
+#     """
+#     num_graphs, den_graphs = graph_compiler.compile(texts, replicate_den=True)
 
-    # TODO: pass output_beam as function argument
-    num_lats = k2.intersect_dense(
-        num_graphs, dense_fsa_vec, output_beam=beam_size, max_arcs=2147483600
-    )
-    den_lats = k2.intersect_dense(
-        den_graphs, dense_fsa_vec, output_beam=beam_size, max_arcs=2147483600
-    )
+#     # TODO: pass output_beam as function argument
+#     num_lats = k2.intersect_dense(
+#         num_graphs, dense_fsa_vec, output_beam=beam_size, max_arcs=2147483600
+#     )
+#     den_lats = k2.intersect_dense(
+#         den_graphs, dense_fsa_vec, output_beam=beam_size, max_arcs=2147483600
+#     )
 
-    num_tot_scores = num_lats.get_tot_scores(log_semiring=True, use_double_scores=True)
+#     num_tot_scores = num_lats.get_tot_scores(log_semiring=True, use_double_scores=True)
 
-    den_tot_scores = den_lats.get_tot_scores(log_semiring=True, use_double_scores=True)
+#     den_tot_scores = den_lats.get_tot_scores(log_semiring=True, use_double_scores=True)
 
-    tot_scores = num_tot_scores - den_scale * den_tot_scores
+#     tot_scores = num_tot_scores - den_scale * den_tot_scores
 
-    loss = -1 * tot_scores.sum()
-    return loss
+#     loss = -1 * tot_scores.sum()
+#     return loss
 
 def _compute_mmi_loss_exact_non_optimized(
     dense_fsa_vec: k2.DenseFsaVec,
