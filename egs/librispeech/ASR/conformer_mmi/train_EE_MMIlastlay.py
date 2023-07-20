@@ -237,8 +237,8 @@ def get_params() -> AttributeDict:
             "num_decoder_layers": 0,
             # parameters for Noam
             "weight_decay": 1e-6,
-            "lr_factor": 5.0,
-            "warm_step": 80000,
+            "lr_factor": 1.0,
+            "warm_step": 1500,
             "den_scale": 1.0,
             # use alignments before this number of batches
             "use_ali_until": 13000,
