@@ -119,7 +119,7 @@ def get_parser():
     parser.add_argument(
         "--att-rate",
         type=float,
-        default=0.8,
+        default=0.0,
         help="""The attention rate.
         The total loss is (1 -  att_rate) * ctc_loss + att_rate * att_loss
         """,
@@ -217,14 +217,14 @@ def get_params() -> AttributeDict:
             "batch_idx_train": 0,
             "log_interval": 50,
             "reset_interval": 200,
-            "valid_interval": 3000,
+            "valid_interval": 150,
             # parameters for conformer
             "feature_dim": 80,
             "subsampling_factor": 4,
             "use_feat_batchnorm": True,
             "attention_dim": 512,
             "nhead": 8,
-            "num_decoder_layers": 6,
+            "num_decoder_layers": 0,
             # parameters for loss
             "beam_size": 10,
             "reduction": "sum",
