@@ -506,7 +506,7 @@ def main():
             simulate_streaming=params.simulate_streaming,
         )
 
-        save_results(params=params, test_set_name=test_set, results_dict=results_dict)
+        #save_results(params=params, test_set_name=test_set, results_dict=results_dict)
 
     logging.info("Done!")
 
