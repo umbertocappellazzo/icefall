@@ -432,6 +432,7 @@ def main():
     sos_id = graph_compiler.sos_id
     eos_id = graph_compiler.eos_id
 
+
     model = Conformer(
         num_features=params.feature_dim,
         nhead=params.nhead,
@@ -439,10 +440,22 @@ def main():
         num_classes=num_classes,
         subsampling_factor=params.subsampling_factor,
         num_decoder_layers=params.num_decoder_layers,
+        num_encoder_layers=2,
         vgg_frontend=params.vgg_frontend,
         use_feat_batchnorm=params.use_feat_batchnorm,
-        causal=params.causal,
     )
+    
+    # model = Conformer(
+    #     num_features=params.feature_dim,
+    #     nhead=params.nhead,
+    #     d_model=params.attention_dim,
+    #     num_classes=num_classes,
+    #     subsampling_factor=params.subsampling_factor,
+    #     num_decoder_layers=params.num_decoder_layers,
+    #     vgg_frontend=params.vgg_frontend,
+    #     use_feat_batchnorm=params.use_feat_batchnorm,
+    #     causal=params.causal,
+    # )
 
     if params.trained_dir is not None:
         model_name = f"{params.trained_dir}/trained_streaming_conformer.pt"
