@@ -479,10 +479,21 @@ def main():
     #
     #   if test_set == 'test-clean': continue
     #
+    
+
+    test_clean_cuts = librispeech.test_clean_cuts()
+    test_other_cuts = librispeech.test_other_cuts()
+
+    test_clean_dl = librispeech.test_dataloaders(test_clean_cuts)
+    test_other_dl = librispeech.test_dataloaders(test_other_cuts)
+
     bpe_model = spm.SentencePieceProcessor()
     bpe_model.load(str(params.lang_dir / "bpe.model"))
     test_sets = ["test-clean", "test-other"]
-    for test_set, test_dl in zip(test_sets, librispeech.test_dataloaders()):
+    test_dls = [test_clean_dl, test_other_dl]
+
+    for test_set, test_dl in zip(test_sets, test_dls):
+    #for test_set, test_dl in zip(test_sets, librispeech.test_dataloaders()):
         results_dict = decode_dataset(
             dl=test_dl,
             params=params,
