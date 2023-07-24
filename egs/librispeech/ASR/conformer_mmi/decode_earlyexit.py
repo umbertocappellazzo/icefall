@@ -263,8 +263,9 @@ def decode_one_batch(
     
     # Change this to choose which intermediate layer to use for decoding. First layer means 2nd layer, secondo means 4th etc.
     # The last one is the last CTC layer of the network.
-    nnet_output = nnet_output[5]
-    #nnet_output = torch.stack(nnet_output).sum(dim=0)
+    #nnet_output = nnet_output[5]
+    
+    nnet_output = torch.stack(nnet_output[0:5]).sum(dim=0)
 
     if H is None:
         assert HLG is not None
