@@ -163,7 +163,7 @@ class Conformer(Transformer):
         x_features = []
         for i in range(0,int(self.num_encoder_layers/2)):
             if i in [0,1,5]:
-                x_features.append(ncoder_memory[i].permute(1,0,2).mean(1))
+                x_features.append(encoder_memory[i].permute(1,0,2).mean(1))
             
             output = self.ctc_output(encoder_memory[i],i)
             x.append(output)
