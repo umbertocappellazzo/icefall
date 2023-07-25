@@ -55,7 +55,7 @@ import torch
 import torch.multiprocessing as mp
 import torch.nn as nn
 from asr_datamodule import LibriSpeechAsrDataModule
-from conformer_earlyexit import Conformer
+from conformer_earlyexit_KD import Conformer
 from lhotse.cut import Cut
 from lhotse.utils import fix_random_seed
 from torch import Tensor
@@ -261,7 +261,7 @@ def get_params() -> AttributeDict:
             "use_double_scores": True,
             # parameters for Noam
             "weight_decay": 1e-6,
-            "warm_step": 17000,
+            "warm_step": 80000,
             "env_info": get_env_info(),
         }
     )
@@ -383,6 +383,9 @@ def compute_loss(
         function enables autograd during computation; when it is False, it
         disables autograd.
     """
+    
+    criterion_mse = torch.nn.MSELoss()
+    
     device = graph_compiler.device
     feature = batch["inputs"]
     # at entry, feature is (N, T, C)
@@ -391,7 +394,7 @@ def compute_loss(
 
     supervisions = batch["supervisions"]
     with torch.set_grad_enabled(is_training):
-        nnet_output, encoder_memory, memory_mask = model(feature, supervisions)
+        nnet_output,output_features, encoder_memory, memory_mask = model(feature, supervisions)
         # nnet_output is (N, T, C)
 
     # NOTE: We need `encode_supervisions` to sort sequences with
@@ -400,7 +403,7 @@ def compute_loss(
     supervision_segments, texts = encode_supervisions(
         supervisions, subsampling_factor=params.subsampling_factor
     )
-
+    
     if isinstance(graph_compiler, BpeCtcTrainingGraphCompiler):
         # Works with a BPE model
         token_ids = graph_compiler.texts_to_ids(texts)
@@ -432,6 +435,10 @@ def compute_loss(
         )
         
         ctc_loss += ctc_loss_int
+    
+    mse_loss = criterion_mse(output_features[0],output_features[-1])*0.5 + criterion_mse(output_features[1],output_features[-1])*0.5
+    
+    
 
     
     
@@ -457,7 +464,7 @@ def compute_loss(
             )
         loss = (1.0 - params.att_rate) * ctc_loss + params.att_rate * att_loss
     else:
-        loss = ctc_loss
+        loss = ctc_loss + mse_loss
         att_loss = torch.tensor([0])
 
     assert loss.requires_grad == is_training
@@ -467,6 +474,8 @@ def compute_loss(
     info["ctc_loss"] = ctc_loss.detach().cpu().item()
     if params.att_rate != 0.0:
         info["att_loss"] = att_loss.detach().cpu().item()
+    info["mse_loss"] = mse_loss.detach().cpu().item()
+    
 
     info["loss"] = loss.detach().cpu().item()
 
@@ -479,7 +488,7 @@ def compute_loss(
         ((feature.size(1) - supervisions["num_frames"]) / feature.size(1)).sum().item()
     )
 
-    return loss, info
+    return loss, ctc_loss,mse_loss, info
 
 
 def compute_validation_loss(
@@ -495,7 +504,7 @@ def compute_validation_loss(
     tot_loss = MetricsTracker()
 
     for batch_idx, batch in enumerate(valid_dl):
-        loss, loss_info = compute_loss(
+        loss, loss_ctc,loss_mse, loss_info = compute_loss(
             params=params,
             model=model,
             batch=batch,
@@ -558,7 +567,7 @@ def train_one_epoch(
         params.batch_idx_train += 1
         batch_size = len(batch["supervisions"]["text"])
 
-        loss, loss_info = compute_loss(
+        loss, loss_ctc, loss_mse, loss_info = compute_loss(
             params=params,
             model=model,
             batch=batch,
@@ -802,7 +811,7 @@ def scan_pessimistic_batches_for_oom(
         batch = train_dl.dataset[cuts]
         try:
             optimizer.zero_grad()
-            loss, _ = compute_loss(
+            loss, _, _, _ = compute_loss(
                 params=params,
                 model=model,
                 batch=batch,
