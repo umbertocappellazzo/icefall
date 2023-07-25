@@ -386,7 +386,6 @@ def compute_loss(
     
     #criterion_mse = torch.nn.MSELoss()
     criterion_cosine = torch.nn.CosineEmbeddingLoss()
-    print("# of frames: ",batch["supervisions"]['num_frames'])
     device = graph_compiler.device
     feature = batch["inputs"]
     # at entry, feature is (N, T, C)
@@ -415,7 +414,7 @@ def compute_loss(
     else:
         raise ValueError(f"Unsupported type of graph compiler: {type(graph_compiler)}")
 
-    
+    print("token ids: ", token_ids)
     ctc_loss = 0.
     
     for i in range(len(nnet_output)):
