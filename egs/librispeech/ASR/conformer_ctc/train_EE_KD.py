@@ -385,7 +385,7 @@ def compute_loss(
     """
     
     #criterion_mse = torch.nn.MSELoss()
-    criterion_cosine = torch.nn.CosineEmbeddingLoss(reduction='sum')
+    criterion_cosine = torch.nn.CosineEmbeddingLoss()
     
     device = graph_compiler.device
     feature = batch["inputs"]
