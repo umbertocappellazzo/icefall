@@ -257,7 +257,7 @@ def get_params() -> AttributeDict:
             "nhead": 8,
             # parameters for loss
             "beam_size": 10,
-            "reduction": "sum",
+            "reduction": "mean",
             "use_double_scores": True,
             # parameters for Noam
             "weight_decay": 1e-6,
@@ -521,7 +521,7 @@ def compute_validation_loss(
     if world_size > 1:
         tot_loss.reduce(loss.device)
 
-    loss_value = tot_loss["loss"] / tot_loss["frames"]
+    loss_value = tot_loss["loss"] #/ tot_loss["frames"]
     if loss_value < params.best_valid_loss:
         params.best_valid_epoch = params.cur_epoch
         params.best_valid_loss = loss_value
@@ -620,7 +620,7 @@ def train_one_epoch(
                     tb_writer, "train/valid_", params.batch_idx_train
                 )
 
-    loss_value = tot_loss["loss"] / tot_loss["frames"]
+    loss_value = tot_loss["loss"] #/ tot_loss["frames"]
     params.train_loss = loss_value
     if params.train_loss < params.best_train_loss:
         params.best_train_epoch = params.cur_epoch
