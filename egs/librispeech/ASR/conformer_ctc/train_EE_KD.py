@@ -488,7 +488,10 @@ def compute_loss(
     info["utt_pad_proportion"] = (
         ((feature.size(1) - supervisions["num_frames"]) / feature.size(1)).sum().item()
     )
-
+    
+    print("CTC loss: ",ctc_loss)
+    print("Cosine loss: ", mse_loss)
+    
     return loss, ctc_loss,mse_loss, info
 
 
