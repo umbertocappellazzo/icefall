@@ -437,7 +437,7 @@ def compute_loss(
         
         ctc_loss += ctc_loss_int
     
-    mse_loss = criterion_cosine(output_features[0],output_features[-1],torch.tensor([1])) + criterion_cosine(output_features[1],output_features[-1],torch.tensor([1]))
+    mse_loss = criterion_cosine(output_features[0],output_features[-1],torch.tensor([1]).to(device)) + criterion_cosine(output_features[1],output_features[-1],torch.tensor([1]).to(device))
     
     
 
