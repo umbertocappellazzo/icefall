@@ -384,7 +384,8 @@ def compute_loss(
         disables autograd.
     """
     
-    criterion_mse = torch.nn.MSELoss()
+    #criterion_mse = torch.nn.MSELoss()
+    criterion_cosine = torch.nn.CosineEmbeddingLoss()
     
     device = graph_compiler.device
     feature = batch["inputs"]
@@ -436,7 +437,7 @@ def compute_loss(
         
         ctc_loss += ctc_loss_int
     
-    mse_loss = criterion_mse(output_features[0],output_features[-1])*0.5 + criterion_mse(output_features[1],output_features[-1])*0.5
+    mse_loss = criterion_cosine(output_features[0],output_features[-1],torch.tensor([1])) + criterion_cosine(output_features[1],output_features[-1],torch.tensor([1]))
     
     
 
