@@ -413,8 +413,9 @@ def compute_loss(
         decoding_graph = graph_compiler.compile(texts)
     else:
         raise ValueError(f"Unsupported type of graph compiler: {type(graph_compiler)}")
-
-    print("token ids: ", token_ids)
+    token_len = [len(x) for x in token_ids]
+    token_len = torch.tensor(token_len).to(device)
+    #print("token ids: ", token_ids)
     ctc_loss = 0.
     
     for i in range(len(nnet_output)):
@@ -432,6 +433,7 @@ def compute_loss(
             output_beam=params.beam_size,
             reduction=params.reduction,
             use_double_scores=params.use_double_scores,
+            target_lengths=token_len
         )
         
         ctc_loss += ctc_loss_int
