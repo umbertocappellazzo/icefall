@@ -466,7 +466,7 @@ def compute_loss(
             )
         loss = (1.0 - params.att_rate) * ctc_loss + params.att_rate * att_loss
     else:
-        loss = ctc_loss + mse_loss
+        loss = ctc_loss*0.5 + mse_loss
         att_loss = torch.tensor([0])
 
     assert loss.requires_grad == is_training
@@ -490,8 +490,8 @@ def compute_loss(
         ((feature.size(1) - supervisions["num_frames"]) / feature.size(1)).sum().item()
     )
     
-    print("CTC loss: ",ctc_loss)
-    print("Cosine loss: ", mse_loss)
+    #print("CTC loss: ",ctc_loss)
+    #print("Cosine loss: ", mse_loss)
     
     return loss, ctc_loss,mse_loss, info
 
