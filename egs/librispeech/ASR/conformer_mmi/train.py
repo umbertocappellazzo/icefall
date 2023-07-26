@@ -258,7 +258,7 @@ def load_checkpoint_if_available(
     """
     if params.start_epoch <= 0:
         return
-    filename = Path('conformer_ctc/exp_2layers') / f"epoch-{params.start_epoch-1}.pt"
+    filename = Path('conformer_ctc/exp_6layers') / f"epoch-{params.start_epoch-1}.pt"
     #filename = '/cappellazzo/icefall_forked/icefall/egs/librispeech/ASR/conformer_ctc/exp'
     #filename = params.exp_dir / f"epoch-{params.start_epoch-1}.pt"
     saved_params = load_checkpoint(
@@ -732,7 +732,7 @@ def run(rank, world_size, args):
         num_classes=num_classes,
         subsampling_factor=params.subsampling_factor,
         num_decoder_layers=params.num_decoder_layers,
-        num_encoder_layers=2,
+        num_encoder_layers=6,
         vgg_frontend=False,
         use_feat_batchnorm=params.use_feat_batchnorm,
     )
