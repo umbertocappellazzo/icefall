@@ -327,7 +327,7 @@ def decode_one_batch(
 
     # Change this to choose which intermediate layer to use for decoding. First layer means 2nd layer, secondo means 4th etc.
     # The last one is the last CTC layer of the network.
-    nnet_output = nnet_output[0]
+    nnet_output = nnet_output[5]
     
     if H is None:
         assert HLG is not None
