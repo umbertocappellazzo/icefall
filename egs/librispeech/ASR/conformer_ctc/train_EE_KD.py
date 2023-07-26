@@ -298,8 +298,8 @@ def load_checkpoint_if_available(
     """
     if params.start_epoch <= 0:
         return
-
-    filename = params.exp_dir / f"epoch-{params.start_epoch-1}.pt"
+    filename = Path('conformer_ctc/exp_EE') / f"epoch-{params.start_epoch-1}.pt"
+    #filename = params.exp_dir / f"epoch-{params.start_epoch-1}.pt"
     saved_params = load_checkpoint(
         filename,
         model=model,
@@ -384,8 +384,8 @@ def compute_loss(
         disables autograd.
     """
     
-    criterion_mse = torch.nn.MSELoss()
-    #criterion_cosine = torch.nn.CosineEmbeddingLoss()
+    #criterion_mse = torch.nn.MSELoss()
+    criterion_cosine = torch.nn.CosineEmbeddingLoss()
     device = graph_compiler.device
     feature = batch["inputs"]
     # at entry, feature is (N, T, C)
@@ -438,8 +438,8 @@ def compute_loss(
         
         ctc_loss += ctc_loss_int
     
-    #mse_loss = criterion_cosine(output_features[0],output_features[-1],torch.tensor([1]).to(device)) + criterion_cosine(output_features[1],output_features[-1],torch.tensor([1]).to(device))
-    mse_loss = criterion_mse(nnet_output[0], nnet_output[-1]) + criterion_mse(nnet_output[1], nnet_output[-1])
+    mse_loss = criterion_cosine(output_features[0],output_features[-1],torch.tensor([1]).to(device)) + criterion_cosine(output_features[1],output_features[-1],torch.tensor([1]).to(device))
+    #mse_loss = criterion_mse(nnet_output[0], nnet_output[-1]) + criterion_mse(nnet_output[1], nnet_output[-1])
     
 
     
