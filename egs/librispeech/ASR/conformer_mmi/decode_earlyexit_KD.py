@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Tue Jun 27 15:55:04 2023
+
+@author: umbertocappellazzo
+"""
+
+#!/usr/bin/env python3
 # Copyright 2021 Xiaomi Corporation (Author: Liyong Guo, Fangjun Kuang)
 #
 # See ../../../../LICENSE for clarification regarding multiple authors
@@ -27,10 +35,10 @@ import sentencepiece as spm
 import torch
 import torch.nn as nn
 from asr_datamodule import LibriSpeechAsrDataModule
-from conformer import Conformer
+from conformer_earlyexit_KD import Conformer
 
 from icefall.bpe_graph_compiler import BpeCtcTrainingGraphCompiler
-from icefall.checkpoint import average_checkpoints, load_checkpoint
+from icefall.checkpoint import load_checkpoint
 from icefall.decode import (
     get_lattice,
     nbest_decoding,
@@ -38,12 +46,16 @@ from icefall.decode import (
     one_best_decoding,
     rescore_with_attention_decoder,
     rescore_with_n_best_list,
+    rescore_with_rnn_lm,
     rescore_with_whole_lattice,
 )
+from icefall.env import get_env_info
 from icefall.lexicon import Lexicon
+from icefall.rnn_lm.model import RnnLmModel
 from icefall.utils import (
     AttributeDict,
     get_texts,
+    load_averaged_model,
     setup_logger,
     store_transcripts,
     str2bool,
@@ -59,14 +71,14 @@ def get_parser():
     parser.add_argument(
         "--epoch",
         type=int,
-        default=34,
+        default=77,
         help="It specifies the checkpoint to use for decoding."
         "Note: Epoch counts from 0.",
     )
     parser.add_argument(
         "--avg",
         type=int,
-        default=20,
+        default=55,
         help="Number of checkpoints to average. Automatically select "
         "consecutive checkpoints before the checkpoint specified by "
         "'--epoch'. ",
@@ -93,7 +105,9 @@ def get_parser():
               is the decoding result.
             - (5) attention-decoder. Extract n paths from the LM rescored
               lattice, the path with the highest score is the decoding result.
-            - (6) nbest-oracle. Its WER is the lower bound of any n-best
+            - (6) rnn-lm. Rescoring with attention-decoder and RNN LM. We assume
+              you have trained an RNN LM using ./rnn_lm/train.py
+            - (7) nbest-oracle. Its WER is the lower bound of any n-best
               rescoring method can achieve. Useful for debugging n-best
               rescoring method.
         """,
@@ -105,7 +119,7 @@ def get_parser():
         default=100,
         help="""Number of paths for n-best based decoding method.
         Used only when "method" is one of the following values:
-        nbest, nbest-rescoring, attention-decoder, and nbest-oracle
+        nbest, nbest-rescoring, attention-decoder, rnn-lm, and nbest-oracle
         """,
     )
 
@@ -116,26 +130,15 @@ def get_parser():
         help="""The scale to be applied to `lattice.scores`.
         It's needed if you use any kinds of n-best based rescoring.
         Used only when "method" is one of the following values:
-        nbest, nbest-rescoring, attention-decoder, and nbest-oracle
+        nbest, nbest-rescoring, attention-decoder, rnn-lm, and nbest-oracle
         A smaller value results in more unique paths.
-        """,
-    )
-
-    parser.add_argument(
-        "--export",
-        type=str2bool,
-        default=False,
-        help="""When enabled, the averaged model is saved to
-        conformer_ctc/exp/pretrained.pt. Note: only model.state_dict() is saved.
-        pretrained.pt contains a dict {"model": model.state_dict()},
-        which can be loaded by `icefall.checkpoint.load_checkpoint()`.
         """,
     )
 
     parser.add_argument(
         "--exp-dir",
         type=str,
-        default="conformer_mmi/exp_500",
+        default="conformer_ctc/exp",
         help="The experiment dir",
     )
 
@@ -147,10 +150,68 @@ def get_parser():
     )
 
     parser.add_argument(
-        "--num-decoder-layers",
+        "--lm-dir",
+        type=str,
+        default="data/lm",
+        help="""The n-gram LM dir.
+        It should contain either G_4_gram.pt or G_4_gram.fst.txt
+        """,
+    )
+
+    parser.add_argument(
+        "--rnn-lm-exp-dir",
+        type=str,
+        default="rnn_lm/exp",
+        help="""Used only when --method is rnn-lm.
+        It specifies the path to RNN LM exp dir.
+        """,
+    )
+
+    parser.add_argument(
+        "--rnn-lm-epoch",
         type=int,
-        default=6,
-        help="Number of attention decoder layers",
+        default=7,
+        help="""Used only when --method is rnn-lm.
+        It specifies the checkpoint to use.
+        """,
+    )
+
+    parser.add_argument(
+        "--rnn-lm-avg",
+        type=int,
+        default=2,
+        help="""Used only when --method is rnn-lm.
+        It specifies the number of checkpoints to average.
+        """,
+    )
+
+    parser.add_argument(
+        "--rnn-lm-embedding-dim",
+        type=int,
+        default=2048,
+        help="Embedding dim of the model",
+    )
+
+    parser.add_argument(
+        "--rnn-lm-hidden-dim",
+        type=int,
+        default=2048,
+        help="Hidden dim of the model",
+    )
+
+    parser.add_argument(
+        "--rnn-lm-num-layers",
+        type=int,
+        default=4,
+        help="Number of RNN layers the model",
+    )
+    parser.add_argument(
+        "--rnn-lm-tie-weights",
+        type=str2bool,
+        default=False,
+        help="""True to share the weights between the input embedding layer and the
+        last output linear layer
+        """,
     )
 
     return parser
@@ -159,7 +220,6 @@ def get_parser():
 def get_params() -> AttributeDict:
     params = AttributeDict(
         {
-            "lm_dir": Path("data/lm"),
             # parameters for conformer
             "subsampling_factor": 4,
             "vgg_frontend": False,
@@ -167,12 +227,14 @@ def get_params() -> AttributeDict:
             "feature_dim": 80,
             "nhead": 8,
             "attention_dim": 512,
+            "num_decoder_layers": 0,
             # parameters for decoding
             "search_beam": 20,
             "output_beam": 8,
             "min_active_states": 30,
             "max_active_states": 10000,
             "use_double_scores": True,
+            "env_info": get_env_info(),
         }
     )
     return params
@@ -181,6 +243,7 @@ def get_params() -> AttributeDict:
 def decode_one_batch(
     params: AttributeDict,
     model: nn.Module,
+    rnn_lm_model: Optional[nn.Module],
     HLG: Optional[k2.Fsa],
     H: Optional[k2.Fsa],
     bpe_model: Optional[spm.SentencePieceProcessor],
@@ -213,6 +276,8 @@ def decode_one_batch(
 
       model:
         The neural model.
+      rnn_lm_model:
+        The neural model for RNN LM.
       HLG:
         The decoding graph. Used only when params.method is NOT ctc-decoding.
       H:
@@ -235,7 +300,7 @@ def decode_one_batch(
         is a 3-gram LM, while this G is a 4-gram LM.
     Returns:
       Return the decoding result. See above description for the format of
-      the returned dict.
+      the returned dict. Note: If it decodes to nothing, then return None.
     """
     if HLG is not None:
         device = HLG.device
@@ -248,7 +313,7 @@ def decode_one_batch(
 
     supervisions = batch["supervisions"]
 
-    nnet_output, memory, memory_key_padding_mask = model(feature, supervisions)
+    nnet_output, _, memory, memory_key_padding_mask = model(feature, supervisions)
     # nnet_output is (N, T, C)
 
     supervision_segments = torch.stack(
@@ -260,6 +325,10 @@ def decode_one_batch(
         1,
     ).to(torch.int32)
 
+    # Change this to choose which intermediate layer to use for decoding. First layer means 2nd layer, secondo means 4th etc.
+    # The last one is the last CTC layer of the network.
+    nnet_output = nnet_output[5]
+    
     if H is None:
         assert HLG is not None
         decoding_graph = HLG
@@ -338,6 +407,7 @@ def decode_one_batch(
         "nbest-rescoring",
         "whole-lattice-rescoring",
         "attention-decoder",
+        "rnn-lm",
     ]
 
     lm_scale_list = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7]
@@ -365,8 +435,6 @@ def decode_one_batch(
             G_with_epsilon_loops=G,
             lm_scale_list=None,
         )
-        # TODO: pass `lattice` instead of `rescored_lattice` to
-        # `rescore_with_attention_decoder`
 
         best_path_dict = rescore_with_attention_decoder(
             lattice=rescored_lattice,
@@ -376,6 +444,26 @@ def decode_one_batch(
             memory_key_padding_mask=memory_key_padding_mask,
             sos_id=sos_id,
             eos_id=eos_id,
+            nbest_scale=params.nbest_scale,
+        )
+    elif params.method == "rnn-lm":
+        # lattice uses a 3-gram Lm. We rescore it with a 4-gram LM.
+        rescored_lattice = rescore_with_whole_lattice(
+            lattice=lattice,
+            G_with_epsilon_loops=G,
+            lm_scale_list=None,
+        )
+
+        best_path_dict = rescore_with_rnn_lm(
+            lattice=rescored_lattice,
+            num_paths=params.num_paths,
+            rnn_lm_model=rnn_lm_model,
+            model=model,
+            memory=memory,
+            memory_key_padding_mask=memory_key_padding_mask,
+            sos_id=sos_id,
+            eos_id=eos_id,
+            blank_id=0,
             nbest_scale=params.nbest_scale,
         )
     else:
@@ -388,8 +476,7 @@ def decode_one_batch(
             hyps = [[word_table[i] for i in ids] for ids in hyps]
             ans[lm_scale_str] = hyps
     else:
-        for lm_scale in lm_scale_list:
-            ans["empty"] = [[] * lattice.shape[0]]
+        ans = None
     return ans
 
 
@@ -397,6 +484,7 @@ def decode_dataset(
     dl: torch.utils.data.DataLoader,
     params: AttributeDict,
     model: nn.Module,
+    rnn_lm_model: Optional[nn.Module],
     HLG: Optional[k2.Fsa],
     H: Optional[k2.Fsa],
     bpe_model: Optional[spm.SentencePieceProcessor],
@@ -414,6 +502,8 @@ def decode_dataset(
         It is returned by :func:`get_params`.
       model:
         The neural model.
+      rnn_lm_model:
+        The neural model for RNN LM.
       HLG:
         The decoding graph. Used only when params.method is NOT ctc-decoding.
       H:
@@ -437,8 +527,6 @@ def decode_dataset(
       The first is the reference transcript, and the second is the
       predicted result.
     """
-    results = []
-
     num_cuts = 0
 
     try:
@@ -454,6 +542,7 @@ def decode_dataset(
         hyps_dict = decode_one_batch(
             params=params,
             model=model,
+            rnn_lm_model=rnn_lm_model,
             HLG=HLG,
             H=H,
             bpe_model=bpe_model,
@@ -464,16 +553,27 @@ def decode_dataset(
             eos_id=eos_id,
         )
 
-        for lm_scale, hyps in hyps_dict.items():
+        if hyps_dict is not None:
+            for lm_scale, hyps in hyps_dict.items():
+                this_batch = []
+                assert len(hyps) == len(texts)
+                for cut_id, hyp_words, ref_text in zip(cut_ids, hyps, texts):
+                    ref_words = ref_text.split()
+                    this_batch.append((cut_id, ref_words, hyp_words))
+
+                results[lm_scale].extend(this_batch)
+        else:
+            assert len(results) > 0, "It should not decode to empty in the first batch!"
             this_batch = []
-            assert len(hyps) == len(texts)
-            for cut_id, hyp_words, ref_text in zip(cut_ids, hyps, texts):
+            hyp_words = []
+            for ref_text in texts:
                 ref_words = ref_text.split()
-                this_batch.append((cut_id, ref_words, hyp_words))
+                this_batch.append((ref_words, hyp_words))
 
-            results[lm_scale].extend(this_batch)
+            for lm_scale in results.keys():
+                results[lm_scale].extend(this_batch)
 
-        num_cuts += len(batch["supervisions"]["text"])
+        num_cuts += len(texts)
 
         if batch_idx % 100 == 0:
             batch_str = f"{batch_idx}/{num_batches}"
@@ -485,9 +585,9 @@ def decode_dataset(
 def save_results(
     params: AttributeDict,
     test_set_name: str,
-    results_dict: Dict[str, List[Tuple[str, List[str], List[str]]]],
+    results_dict: Dict[str, List[Tuple[str, List[int], List[int]]]],
 ):
-    if params.method == "attention-decoder":
+    if params.method in ("attention-decoder", "rnn-lm"):
         # Set it to False since there are too many logs.
         enable_log = False
     else:
@@ -534,6 +634,7 @@ def main():
     args = parser.parse_args()
     args.exp_dir = Path(args.exp_dir)
     args.lang_dir = Path(args.lang_dir)
+    args.lm_dir = Path(args.lm_dir)
 
     params = get_params()
     params.update(vars(args))
@@ -561,6 +662,10 @@ def main():
     sos_id = graph_compiler.sos_id
     eos_id = graph_compiler.eos_id
 
+    params.num_classes = num_classes
+    params.sos_id = sos_id
+    params.eos_id = eos_id
+
     if params.method == "ctc-decoding":
         HLG = None
         H = k2.ctc_topo(
@@ -574,9 +679,8 @@ def main():
         H = None
         bpe_model = None
         HLG = k2.Fsa.from_dict(
-            torch.load(f"{params.lang_dir}/HLG.pt", map_location="cpu")
+            torch.load(f"{params.lang_dir}/HLG.pt", map_location=device)
         )
-        HLG = HLG.to(device)
         assert HLG.requires_grad is False
 
         if not hasattr(HLG, "lm_scores"):
@@ -586,6 +690,7 @@ def main():
         "nbest-rescoring",
         "whole-lattice-rescoring",
         "attention-decoder",
+        "rnn-lm",
     ):
         if not (params.lm_dir / "G_4_gram.pt").is_file():
             logging.info("Loading G_4_gram.fst.txt")
@@ -606,13 +711,22 @@ def main():
                 G.__dict__["_properties"] = None
                 G = k2.Fsa.from_fsas([G]).to(device)
                 G = k2.arc_sort(G)
+                # Save a dummy value so that it can be loaded in C++.
+                # See https://github.com/pytorch/pytorch/issues/67902
+                # for why we need to do this.
+                G.dummy = 1
+
                 torch.save(G.as_dict(), params.lm_dir / "G_4_gram.pt")
         else:
             logging.info("Loading pre-compiled G_4_gram.pt")
-            d = torch.load(params.lm_dir / "G_4_gram.pt", map_location="cpu")
-            G = k2.Fsa.from_dict(d).to(device)
+            d = torch.load(params.lm_dir / "G_4_gram.pt", map_location=device)
+            G = k2.Fsa.from_dict(d)
 
-        if params.method in ["whole-lattice-rescoring", "attention-decoder"]:
+        if params.method in [
+            "whole-lattice-rescoring",
+            "attention-decoder",
+            "rnn-lm",
+        ]:
             # Add epsilon self-loops to G as we will compose
             # it with the whole lattice later
             G = k2.add_epsilon_self_loops(G)
@@ -632,7 +746,6 @@ def main():
         num_classes=num_classes,
         subsampling_factor=params.subsampling_factor,
         num_decoder_layers=params.num_decoder_layers,
-        num_encoder_layers=6,
         vgg_frontend=params.vgg_frontend,
         use_feat_batchnorm=params.use_feat_batchnorm,
     )
@@ -640,23 +753,39 @@ def main():
     if params.avg == 1:
         load_checkpoint(f"{params.exp_dir}/epoch-{params.epoch}.pt", model)
     else:
-        start = params.epoch - params.avg + 1
-        filenames = []
-        for i in range(start, params.epoch + 1):
-            if start >= 0:
-                filenames.append(f"{params.exp_dir}/epoch-{i}.pt")
-        logging.info(f"averaging {filenames}")
-        model.load_state_dict(average_checkpoints(filenames))
-
-    if params.export:
-        logging.info(f"Export averaged model to {params.exp_dir}/pretrained.pt")
-        torch.save({"model": model.state_dict()}, f"{params.exp_dir}/pretrained.pt")
-        return
+        model = load_averaged_model(
+            params.exp_dir, model, params.epoch, params.avg, device
+        )
 
     model.to(device)
     model.eval()
     num_param = sum([p.numel() for p in model.parameters()])
     logging.info(f"Number of model parameters: {num_param}")
+
+    rnn_lm_model = None
+    if params.method == "rnn-lm":
+        rnn_lm_model = RnnLmModel(
+            vocab_size=params.num_classes,
+            embedding_dim=params.rnn_lm_embedding_dim,
+            hidden_dim=params.rnn_lm_hidden_dim,
+            num_layers=params.rnn_lm_num_layers,
+            tie_weights=params.rnn_lm_tie_weights,
+        )
+        if params.rnn_lm_avg == 1:
+            load_checkpoint(
+                f"{params.rnn_lm_exp_dir}/epoch-{params.rnn_lm_epoch}.pt",
+                rnn_lm_model,
+            )
+            rnn_lm_model.to(device)
+        else:
+            rnn_lm_model = load_averaged_model(
+                params.rnn_lm_exp_dir,
+                rnn_lm_model,
+                params.rnn_lm_epoch,
+                params.rnn_lm_avg,
+                device,
+            )
+        rnn_lm_model.eval()
 
     # we need cut ids to display recognition results.
     args.return_cuts = True
@@ -668,19 +797,15 @@ def main():
     test_clean_dl = librispeech.test_dataloaders(test_clean_cuts)
     test_other_dl = librispeech.test_dataloaders(test_other_cuts)
 
-    # CAUTION: `test_sets` is for displaying only.
-    # If you want to skip test-clean, you have to skip
-    # it inside the for loop. That is, use
-    #
-    #   if test_set == 'test-clean': continue
     test_sets = ["test-clean", "test-other"]
-    test_dls = [test_clean_dl, test_other_dl]
+    test_dl = [test_clean_dl, test_other_dl]
 
-    for test_set, test_dl in zip(test_sets, test_dls):
+    for test_set, test_dl in zip(test_sets, test_dl):
         results_dict = decode_dataset(
             dl=test_dl,
             params=params,
             model=model,
+            rnn_lm_model=rnn_lm_model,
             HLG=HLG,
             H=H,
             bpe_model=bpe_model,
