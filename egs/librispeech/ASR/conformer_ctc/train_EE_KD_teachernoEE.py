@@ -1,14 +1,23 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Created on Mon Jul  3 11:38:43 2023
+Created on Mon Jul 31 09:37:59 2023
+
+@author: umbertocappellazzo
+"""
+
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Tue Jun 27 15:54:04 2023
 
 @author: umbertocappellazzo
 """
 
 #!/usr/bin/env python3
 # Copyright    2021  Xiaomi Corp.        (authors: Fangjun Kuang,
-#                                                  Wei Kang)
+#                                                  Wei Kang
+#                                                  Mingshuang Luo)
 #
 # See ../../../../LICENSE for clarification regarding multiple authors
 #
@@ -24,40 +33,51 @@ Created on Mon Jul  3 11:38:43 2023
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""
+Usage:
+  export CUDA_VISIBLE_DEVICES="0,1,2,3"
+  ./conformer_ctc/train.py \
+     --exp-dir ./conformer_ctc/exp \
+     --world-size 4 \
+     --full-libri 1 \
+     --max-duration 200 \
+     --num-epochs 20
+"""
 
 import argparse
 import logging
 from pathlib import Path
 from shutil import copyfile
-from typing import Dict, Optional
+from typing import Optional, Tuple
 
 import k2
 import torch
-import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn as nn
 from asr_datamodule import LibriSpeechAsrDataModule
-from conformer_earlyexit import Conformer
+from conformer_earlyexit_KD import Conformer
 from lhotse.cut import Cut
-from lhotse.dataset.sampling.base import CutSampler
 from lhotse.utils import fix_random_seed
+from torch import Tensor
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.nn.utils import clip_grad_norm_
 from torch.utils.tensorboard import SummaryWriter
 from transformer import Noam
 
-from icefall.ali import convert_alignments_to_tensor, load_alignments, lookup_alignments
+from icefall.bpe_graph_compiler import BpeCtcTrainingGraphCompiler
 from icefall.checkpoint import load_checkpoint
 from icefall.checkpoint import save_checkpoint as save_checkpoint_impl
 from icefall.dist import cleanup_dist, setup_dist
+from icefall.env import get_env_info
+from icefall.graph_compiler import CtcTrainingGraphCompiler
 from icefall.lexicon import Lexicon
-from icefall.mmi import LFMMILoss
-from icefall.mmi_graph_compiler import MmiTrainingGraphCompiler
-from icefall.utils import AttributeDict, encode_supervisions, setup_logger, str2bool
-
-
-import time
-import datetime
+from icefall.utils import (
+    AttributeDict,
+    MetricsTracker,
+    encode_supervisions,
+    setup_logger,
+    str2bool,
+)
 
 
 def get_parser():
@@ -89,35 +109,24 @@ def get_parser():
     parser.add_argument(
         "--num-epochs",
         type=int,
-        default=50,
+        default=78,
         help="Number of epochs to train.",
     )
 
     parser.add_argument(
         "--start-epoch",
         type=int,
-        default=5,
+        default=0,
         help="""Resume training from from this epoch.
         If it is positive, it will load checkpoint from
-        conformer_mmi/exp/epoch-{start_epoch-1}.pt
-        """,
-    )
-
-    parser.add_argument(
-        "--ali-dir",
-        type=str,
-        default="data/ali_500",
-        help="""This folder is expected to contain
-        two files, train-960.pt and valid.pt, which
-        contain framewise alignment information for
-        the training set and validation set.
+        conformer_ctc/exp/epoch-{start_epoch-1}.pt
         """,
     )
 
     parser.add_argument(
         "--exp-dir",
         type=str,
-        default="conformer_mmi/exp",
+        default="conformer_ctc/exp",
         help="""The experiment dir.
         It specifies the directory where all training related
         files, e.g., checkpoints, log, etc, are saved
@@ -135,18 +144,35 @@ def get_parser():
     )
 
     parser.add_argument(
+        "--att-rate",
+        type=float,
+        default=0.8,
+        help="""The attention rate.
+        The total loss is (1 -  att_rate) * ctc_loss + att_rate * att_loss
+        """,
+    )
+
+    parser.add_argument(
+        "--num-decoder-layers",
+        type=int,
+        default=6,
+        help="""Number of decoder layer of transformer decoder.
+        Setting this to 0 will not create the decoder at all (pure CTC model)
+        """,
+    )
+
+    parser.add_argument(
+        "--lr-factor",
+        type=float,
+        default=5.0,
+        help="The lr_factor for Noam optimizer",
+    )
+
+    parser.add_argument(
         "--seed",
         type=int,
         default=42,
         help="The seed for random generators intended for reproducibility",
-    )
-
-    parser.add_argument(
-        "--use-pruned-intersect",
-        type=str2bool,
-        default=False,
-        help="""Whether to use `intersect_dense_pruned` to get denominator
-        lattice.""",
     )
 
     return parser
@@ -190,8 +216,12 @@ def get_params() -> AttributeDict:
 
         - subsampling_factor:  The subsampling factor for the model.
 
-        - use_feat_batchnorm: Whether to do batch normalization for the
-                              input features.
+        - use_feat_batchnorm: Normalization for the input features, can be a
+                              boolean indicating whether to do batch
+                              normalization, or a float which means just scaling
+                              the input features with this float value.
+                              If given a float value, we will remove batchnorm
+                              layer in `ConvolutionModule` as well.
 
         - attention_dim: Hidden dim for multi-head attention model.
 
@@ -199,9 +229,13 @@ def get_params() -> AttributeDict:
 
         - num_decoder_layers: Number of decoder layer of transformer decoder.
 
-        - weight_decay:  The weight_decay for the optimizer.
+        - beam_size: It is used in k2.ctc_loss
 
-        - lr_factor: The lr_factor for Noam optimizer.
+        - reduction: It is used in k2.ctc_loss
+
+        - use_double_scores: It is used in k2.ctc_loss
+
+        - weight_decay:  The weight_decay for the optimizer.
 
         - warm_step: The warm_step for Noam optimizer.
     """
@@ -212,9 +246,9 @@ def get_params() -> AttributeDict:
             "best_train_epoch": -1,
             "best_valid_epoch": -1,
             "batch_idx_train": 0,
-            "log_interval": 30,
-            "reset_interval": 200,
-            "valid_interval": 100,
+            "log_interval": 100,
+            "reset_interval": 150,
+            "valid_interval": 300,
             # parameters for conformer
             "feature_dim": 80,
             "subsampling_factor": 4,
@@ -222,18 +256,13 @@ def get_params() -> AttributeDict:
             "attention_dim": 512,
             "nhead": 8,
             # parameters for loss
-            "beam_size": 6,  # will change it to 8 after some batches (see code)
-            "reduction": "sum",
+            "beam_size": 10,
+            "reduction": "mean",
             "use_double_scores": True,
-            "att_rate": 0.0,
-            "num_decoder_layers": 0,
             # parameters for Noam
             "weight_decay": 1e-6,
-            "lr_factor": 5.0,
             "warm_step": 80000,
-            "den_scale": 1.0,
-            # use alignments before this number of batches
-            "use_ali_until": 13000,
+            "env_info": get_env_info(),
         }
     )
 
@@ -270,7 +299,6 @@ def load_checkpoint_if_available(
     if params.start_epoch <= 0:
         return
     filename = Path('conformer_ctc/exp_EE') / f"epoch-{params.start_epoch-1}.pt"
-    #filename = '/cappellazzo/icefall_forked/icefall/egs/librispeech/ASR/conformer_ctc/exp_EE'
     #filename = params.exp_dir / f"epoch-{params.start_epoch-1}.pt"
     saved_params = load_checkpoint(
         filename,
@@ -332,12 +360,11 @@ def compute_loss(
     params: AttributeDict,
     model: nn.Module,
     batch: dict,
-    graph_compiler: MmiTrainingGraphCompiler,
+    graph_compiler: BpeCtcTrainingGraphCompiler,
     is_training: bool,
-    ali: Optional[Dict[str, torch.Tensor]],
-):
+) -> Tuple[Tensor, MetricsTracker]:
     """
-    Compute LF-MMI loss given the model and its inputs.
+    Compute CTC loss given the model and its inputs.
 
     Args:
       params:
@@ -355,9 +382,10 @@ def compute_loss(
         True for training. False for validation. When it is True, this
         function enables autograd during computation; when it is False, it
         disables autograd.
-      ali:
-        Precomputed alignments.
     """
+    
+    criterion_mse = torch.nn.MSELoss()
+    #criterion_cosine = torch.nn.CosineEmbeddingLoss()
     device = graph_compiler.device
     feature = batch["inputs"]
     # at entry, feature is (N, T, C)
@@ -366,179 +394,149 @@ def compute_loss(
 
     supervisions = batch["supervisions"]
     with torch.set_grad_enabled(is_training):
-        nnet_output, encoder_memory, memory_mask = model(feature, supervisions)
+        nnet_output,output_features, encoder_memory, memory_mask = model(feature, supervisions)
         # nnet_output is (N, T, C)
 
-        # NOTE: We need `encode_supervisions` to sort sequences with
-        # different duration in decreasing order, required by
-        # `k2.intersect_dense` called in `LFMMILoss.forward()`
-        supervision_segments, texts = encode_supervisions(
-            supervisions, subsampling_factor=params.subsampling_factor
-        )
-
-        
-        
-        
-        if ali is not None and params.batch_idx_train < params.use_ali_until:
-            cut_ids = [cut.id for cut in supervisions["cut"]]
-
-            # As encode_supervisions reorders cuts, we need
-            # also to reorder cut IDs here
-            new2old = supervision_segments[:, 0].tolist()
-            cut_ids = [cut_ids[i] for i in new2old]
-
-            # Check that new2old is just a permutation,
-            # i.e., each cut contains only one utterance
-            new2old.sort()
-            assert new2old == torch.arange(len(new2old)).tolist()
-            mask = lookup_alignments(
-                cut_ids=cut_ids,
-                alignments=ali,
-                num_classes=nnet_output.shape[2],
-            ).to(nnet_output)
-            
-            nnet_output = nnet_output.clone()
-            for i in range(len(nnet_output)):
-                
-                
-                min_len = min(nnet_output[i].shape[1], mask.shape[1])
-                ali_scale = 500.0 / (params.batch_idx_train + 500)
+    # NOTE: We need `encode_supervisions` to sort sequences with
+    # different duration in decreasing order, required by
+    # `k2.intersect_dense` called in `k2.ctc_loss`
+    supervision_segments, texts = encode_supervisions(
+        supervisions, subsampling_factor=params.subsampling_factor
+    )
     
-                #nnet_output = nnet_output.clone()
-                nnet_output[i][:, :min_len, :] += ali_scale * mask[:, :min_len, :]
-
-        if params.batch_idx_train > params.use_ali_until and params.beam_size < 8:
-            #logging.info("Change beam size to 8")
-            params.beam_size = 8
-        else:
-            params.beam_size = 6
-
-        loss_fn = LFMMILoss(
-            graph_compiler=graph_compiler,
-            use_pruned_intersect=params.use_pruned_intersect,
-            den_scale=params.den_scale,
-            beam_size=params.beam_size,
+    if isinstance(graph_compiler, BpeCtcTrainingGraphCompiler):
+        # Works with a BPE model
+        token_ids = graph_compiler.texts_to_ids(texts)
+        decoding_graph = graph_compiler.compile(token_ids)
+    elif isinstance(graph_compiler, CtcTrainingGraphCompiler):
+        # Works with a phone lexicon
+        decoding_graph = graph_compiler.compile(texts)
+    else:
+        raise ValueError(f"Unsupported type of graph compiler: {type(graph_compiler)}")
+    token_len = [len(x) for x in token_ids]
+    token_len = torch.tensor(token_len).to(device)
+    #print("token ids: ", token_ids)
+    ctc_loss = 0.
+    
+    for i in range(len(nnet_output)):
+        
+    
+        dense_fsa_vec = k2.DenseFsaVec(
+            nnet_output[i],
+            supervision_segments,
+            allow_truncate=params.subsampling_factor - 1,
+        )
+    # _int stands for intermediate.
+        ctc_loss_int = k2.ctc_loss(
+            decoding_graph=decoding_graph,
+            dense_fsa_vec=dense_fsa_vec,
+            output_beam=params.beam_size,
+            reduction=params.reduction,
+            use_double_scores=params.use_double_scores,
+            target_lengths=token_len
         )
         
-        
-        nnet_output_sum = torch.stack(nnet_output).sum(dim=0)
+        ctc_loss += ctc_loss_int
+    
+    #mse_loss = criterion_cosine(output_features[0],output_features[-1],torch.tensor([1]).to(device)) + criterion_cosine(output_features[1],output_features[-1],torch.tensor([1]).to(device))
+    mse_loss = criterion_mse(nnet_output[0], nnet_output[-1]) + criterion_mse(nnet_output[1], nnet_output[-1])
+    
 
-        dense_fsa_vec = k2.DenseFsaVec(
-                 nnet_output_sum,
-                 supervision_segments,
-                 allow_truncate=params.subsampling_factor - 1,
-            )
-
-        mmi_loss = 0.
-        #mmi_loss = loss_fn(dense_fsa_vec=dense_fsa_vec, texts=texts)
-        for i in range(len(nnet_output)):
-            
-            
-            #_int stands for intermediate.
-                
-            dense_fsa_vec = k2.DenseFsaVec(
-                nnet_output[i],
-                supervision_segments,
-                allow_truncate=params.subsampling_factor - 1,
-            )
-            mmi_loss_int = loss_fn(dense_fsa_vec=dense_fsa_vec, texts=texts)
-            mmi_loss += mmi_loss_int
-
+    
+    
+    
     if params.att_rate != 0.0:
-        token_ids = graph_compiler.texts_to_ids(supervisions["text"])
         with torch.set_grad_enabled(is_training):
             mmodel = model.module if hasattr(model, "module") else model
+            # Note: We need to generate an unsorted version of token_ids
+            # `encode_supervisions()` called above sorts text, but
+            # encoder_memory and memory_mask are not sorted, so we
+            # use an unsorted version `supervisions["text"]` to regenerate
+            # the token_ids
+            #
+            # See https://github.com/k2-fsa/icefall/issues/97
+            # for more details
+            unsorted_token_ids = graph_compiler.texts_to_ids(supervisions["text"])
             att_loss = mmodel.decoder_forward(
                 encoder_memory,
                 memory_mask,
-                token_ids=token_ids,
+                token_ids=unsorted_token_ids,
                 sos_id=graph_compiler.sos_id,
                 eos_id=graph_compiler.eos_id,
             )
-        loss = (1.0 - params.att_rate) * mmi_loss + params.att_rate * att_loss
+        loss = (1.0 - params.att_rate) * ctc_loss + params.att_rate * att_loss
     else:
-        loss = mmi_loss
+        loss = ctc_loss*0.5 + mse_loss
         att_loss = torch.tensor([0])
-
-    # train_frames and valid_frames are used for printing.
-    if is_training:
-        params.train_frames = supervision_segments[:, 2].sum().item()
-    else:
-        params.valid_frames = supervision_segments[:, 2].sum().item()
 
     assert loss.requires_grad == is_training
 
-    return loss, mmi_loss.detach(), att_loss.detach()
+    info = MetricsTracker()
+    info["frames"] = supervision_segments[:, 2].sum().item()
+    info["ctc_loss"] = ctc_loss.detach().cpu().item()
+    if params.att_rate != 0.0:
+        info["att_loss"] = att_loss.detach().cpu().item()
+    info["mse_loss"] = mse_loss.detach().cpu().item()
+    
+
+    info["loss"] = loss.detach().cpu().item()
+
+    # `utt_duration` and `utt_pad_proportion` would be normalized by `utterances`  # noqa
+    info["utterances"] = feature.size(0)
+    # averaged input duration in frames over utterances
+    info["utt_duration"] = supervisions["num_frames"].sum().item()
+    # averaged padding proportion over utterances
+    info["utt_pad_proportion"] = (
+        ((feature.size(1) - supervisions["num_frames"]) / feature.size(1)).sum().item()
+    )
+    
+    #print("CTC loss: ",ctc_loss)
+    #print("Cosine loss: ", mse_loss)
+    
+    return loss, ctc_loss,mse_loss, info
 
 
 def compute_validation_loss(
     params: AttributeDict,
     model: nn.Module,
-    graph_compiler: MmiTrainingGraphCompiler,
+    graph_compiler: BpeCtcTrainingGraphCompiler,
     valid_dl: torch.utils.data.DataLoader,
     world_size: int = 1,
-    ali: Optional[Dict[str, torch.Tensor]] = None,
-) -> None:
-    """Run the validation process. The validation loss
-    is saved in `params.valid_loss`.
-    """
+) -> MetricsTracker:
+    """Run the validation process."""
     model.eval()
 
-    tot_loss = 0.0
-    tot_mmi_loss = 0.0
-    tot_att_loss = 0.0
-    tot_frames = 0.0
+    tot_loss = MetricsTracker()
+
     for batch_idx, batch in enumerate(valid_dl):
-        loss, mmi_loss, att_loss = compute_loss(
+        loss, loss_ctc,loss_mse, loss_info = compute_loss(
             params=params,
             model=model,
             batch=batch,
             graph_compiler=graph_compiler,
             is_training=False,
-            ali=ali,
         )
         assert loss.requires_grad is False
-        assert mmi_loss.requires_grad is False
-        assert att_loss.requires_grad is False
-
-        loss_cpu = loss.detach().cpu().item()
-        tot_loss += loss_cpu
-
-        tot_mmi_loss += mmi_loss.detach().cpu().item()
-        tot_att_loss += att_loss.detach().cpu().item()
-
-        tot_frames += params.valid_frames
+        tot_loss = tot_loss + loss_info
 
     if world_size > 1:
-        s = torch.tensor(
-            [tot_loss, tot_mmi_loss, tot_att_loss, tot_frames],
-            device=loss.device,
-        )
-        dist.all_reduce(s, op=dist.ReduceOp.SUM)
-        s = s.cpu().tolist()
-        tot_loss = s[0]
-        tot_mmi_loss = s[1]
-        tot_att_loss = s[2]
-        tot_frames = s[3]
+        tot_loss.reduce(loss.device)
 
-    params.valid_loss = tot_loss / tot_frames
-    params.valid_mmi_loss = tot_mmi_loss / tot_frames
-    params.valid_att_loss = tot_att_loss / tot_frames
-
-    if params.valid_loss < params.best_valid_loss:
+    loss_value = tot_loss["loss"] #/ tot_loss["frames"]
+    if loss_value < params.best_valid_loss:
         params.best_valid_epoch = params.cur_epoch
-        params.best_valid_loss = params.valid_loss
+        params.best_valid_loss = loss_value
+
+    return tot_loss
 
 
 def train_one_epoch(
     params: AttributeDict,
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
-    graph_compiler: MmiTrainingGraphCompiler,
+    graph_compiler: BpeCtcTrainingGraphCompiler,
     train_dl: torch.utils.data.DataLoader,
     valid_dl: torch.utils.data.DataLoader,
-    train_ali: Optional[Dict[str, torch.Tensor]],
-    valid_ali: Optional[Dict[str, torch.Tensor]],
     tb_writer: Optional[SummaryWriter] = None,
     world_size: int = 1,
 ) -> None:
@@ -561,10 +559,6 @@ def train_one_epoch(
         Dataloader for the training dataset.
       valid_dl:
         Dataloader for the validation dataset.
-      train_ali:
-        Precomputed alignments for the training set.
-      valid_ali:
-        Precomputed alignments for the validation set.
       tb_writer:
         Writer to write log messages to tensorboard.
       world_size:
@@ -572,25 +566,21 @@ def train_one_epoch(
     """
     model.train()
 
-    tot_loss = 0.0  # sum of losses over all batches
-    tot_mmi_loss = 0.0
-    tot_att_loss = 0.0
+    tot_loss = MetricsTracker()
 
-    tot_frames = 0.0  # sum of frames over all batches
-    params.tot_loss = 0.0
-    params.tot_frames = 0.0
     for batch_idx, batch in enumerate(train_dl):
         params.batch_idx_train += 1
         batch_size = len(batch["supervisions"]["text"])
 
-        loss, mmi_loss, att_loss = compute_loss(
+        loss, loss_ctc, loss_mse, loss_info = compute_loss(
             params=params,
             model=model,
             batch=batch,
             graph_compiler=graph_compiler,
             is_training=True,
-            ali=train_ali,
         )
+        # summary stats
+        tot_loss = (tot_loss * (1 - 1 / params.reset_interval)) + loss_info
 
         # NOTE: We use reduction==sum and loss is computed over utterances
         # in the batch and there is no normalization to it so far.
@@ -600,110 +590,39 @@ def train_one_epoch(
         clip_grad_norm_(model.parameters(), 5.0, 2.0)
         optimizer.step()
 
-        loss_cpu = loss.detach().cpu().item()
-        mmi_loss_cpu = mmi_loss.detach().cpu().item()
-        att_loss_cpu = att_loss.detach().cpu().item()
-
-        tot_frames += params.train_frames
-        tot_loss += loss_cpu
-        tot_mmi_loss += mmi_loss_cpu
-        tot_att_loss += att_loss_cpu
-
-        params.tot_frames += params.train_frames
-        params.tot_loss += loss_cpu
-
-        tot_avg_loss = tot_loss / tot_frames
-        tot_avg_mmi_loss = tot_mmi_loss / tot_frames
-        tot_avg_att_loss = tot_att_loss / tot_frames
-
         if batch_idx % params.log_interval == 0:
             logging.info(
-                f"Epoch {params.cur_epoch}, batch {batch_idx}, "
-                f"batch avg mmi loss {mmi_loss_cpu/params.train_frames:.4f}, "
-                f"batch avg att loss {att_loss_cpu/params.train_frames:.4f}, "
-                f"batch avg loss {loss_cpu/params.train_frames:.4f}, "
-                f"total avg mmiloss: {tot_avg_mmi_loss:.4f}, "
-                f"total avg att loss: {tot_avg_att_loss:.4f}, "
-                f"total avg loss: {tot_avg_loss:.4f}, "
-                f"batch size: {batch_size}"
+                f"Epoch {params.cur_epoch}, "
+                f"batch {batch_idx}, loss[{loss_info}], "
+                f"tot_loss[{tot_loss}], batch size: {batch_size}"
             )
 
+        if batch_idx % params.log_interval == 0:
+
             if tb_writer is not None:
-                tb_writer.add_scalar(
-                    "train/current_mmi_loss",
-                    mmi_loss_cpu / params.train_frames,
-                    params.batch_idx_train,
+                loss_info.write_summary(
+                    tb_writer, "train/current_", params.batch_idx_train
                 )
-                tb_writer.add_scalar(
-                    "train/current_att_loss",
-                    att_loss_cpu / params.train_frames,
-                    params.batch_idx_train,
-                )
-                tb_writer.add_scalar(
-                    "train/current_loss",
-                    loss_cpu / params.train_frames,
-                    params.batch_idx_train,
-                )
-                tb_writer.add_scalar(
-                    "train/tot_avg_mmi_loss",
-                    tot_avg_mmi_loss,
-                    params.batch_idx_train,
-                )
-
-                tb_writer.add_scalar(
-                    "train/tot_avg_att_loss",
-                    tot_avg_att_loss,
-                    params.batch_idx_train,
-                )
-                tb_writer.add_scalar(
-                    "train/tot_avg_loss",
-                    tot_avg_loss,
-                    params.batch_idx_train,
-                )
-        if batch_idx > 0 and batch_idx % params.reset_interval == 0:
-            tot_loss = 0.0  # sum of losses over all batches
-            tot_mmi_loss = 0.0
-            tot_att_loss = 0.0
-
-            tot_frames = 0.0  # sum of frames over all batches
+                tot_loss.write_summary(tb_writer, "train/tot_", params.batch_idx_train)
 
         if batch_idx > 0 and batch_idx % params.valid_interval == 0:
-            compute_validation_loss(
+            logging.info("Computing validation loss")
+            valid_info = compute_validation_loss(
                 params=params,
                 model=model,
                 graph_compiler=graph_compiler,
                 valid_dl=valid_dl,
                 world_size=world_size,
-                ali=valid_ali,
             )
             model.train()
-            logging.info(
-                f"Epoch {params.cur_epoch}, "
-                f"valid mmi loss {params.valid_mmi_loss:.4f},"
-                f"valid att loss {params.valid_att_loss:.4f},"
-                f"valid loss {params.valid_loss:.4f},"
-                f" best valid loss: {params.best_valid_loss:.4f} "
-                f"best valid epoch: {params.best_valid_epoch}"
-            )
+            logging.info(f"Epoch {params.cur_epoch}, validation: {valid_info}")
             if tb_writer is not None:
-                tb_writer.add_scalar(
-                    "train/valid_mmi_loss",
-                    params.valid_mmi_loss,
-                    params.batch_idx_train,
-                )
-                tb_writer.add_scalar(
-                    "train/valid_att_loss",
-                    params.valid_att_loss,
-                    params.batch_idx_train,
-                )
-                tb_writer.add_scalar(
-                    "train/valid_loss",
-                    params.valid_loss,
-                    params.batch_idx_train,
+                valid_info.write_summary(
+                    tb_writer, "train/valid_", params.batch_idx_train
                 )
 
-    params.train_loss = params.tot_loss / params.tot_frames
-
+    loss_value = tot_loss["loss"] #/ tot_loss["frames"]
+    params.train_loss = loss_value
     if params.train_loss < params.best_train_loss:
         params.best_train_epoch = params.cur_epoch
         params.best_train_loss = params.train_loss
@@ -721,9 +640,6 @@ def run(rank, world_size, args):
       args:
         The return value of get_parser().parse_args()
     """
-    
-    
-    start_time = time.time()
     params = get_params()
     params.update(vars(args))
 
@@ -748,19 +664,40 @@ def run(rank, world_size, args):
     if torch.cuda.is_available():
         device = torch.device("cuda", rank)
 
-    graph_compiler = MmiTrainingGraphCompiler(
-        params.lang_dir,
-        uniq_filename="lexicon.txt",
-        device=device,
-        oov="<UNK>",
-        sos_id=1,
-        eos_id=1,
-    )
+    if "lang_bpe" in str(params.lang_dir):
+        graph_compiler = BpeCtcTrainingGraphCompiler(
+            params.lang_dir,
+            device=device,
+            sos_token="<sos/eos>",
+            eos_token="<sos/eos>",
+        )
+    elif "lang_phone" in str(params.lang_dir):
+        assert params.att_rate == 0, (
+            "Attention decoder training does not support phone lang dirs "
+            "at this time due to a missing <sos/eos> symbol. Set --att-rate=0 "
+            "for pure CTC training when using a phone-based lang dir."
+        )
+        assert params.num_decoder_layers == 0, (
+            "Attention decoder training does not support phone lang dirs "
+            "at this time due to a missing <sos/eos> symbol. "
+            "Set --num-decoder-layers=0 for pure CTC training when using "
+            "a phone-based lang dir."
+        )
+        graph_compiler = CtcTrainingGraphCompiler(
+            lexicon,
+            device=device,
+        )
+        # Manually add the sos/eos ID with their default values
+        # from the BPE recipe which we're adapting here.
+        graph_compiler.sos_id = 1
+        graph_compiler.eos_id = 1
+    else:
+        raise ValueError(
+            f"Unsupported type of lang dir (we expected it to have "
+            f"'lang_bpe' or 'lang_phone' in its name): {params.lang_dir}"
+        )
 
     logging.info("About to create model")
-    if params.att_rate == 0:
-        assert params.num_decoder_layers == 0, f"{params.num_decoder_layers}"
-
     model = Conformer(
         num_features=params.feature_dim,
         nhead=params.nhead,
@@ -789,32 +726,12 @@ def run(rank, world_size, args):
     if checkpoints:
         optimizer.load_state_dict(checkpoints["optimizer"])
 
-    train_960_ali_filename = Path(params.ali_dir) / "train-960.pt"
-    if (
-        params.batch_idx_train < params.use_ali_until
-        and train_960_ali_filename.is_file()
-    ):
-        logging.info("Use pre-computed alignments")
-        subsampling_factor, train_ali = load_alignments(train_960_ali_filename)
-        assert subsampling_factor == params.subsampling_factor
-        assert len(train_ali) == 843723, f"{len(train_ali)} vs 843723"
-
-        valid_ali_filename = Path(params.ali_dir) / "valid.pt"
-        subsampling_factor, valid_ali = load_alignments(valid_ali_filename)
-        assert subsampling_factor == params.subsampling_factor
-
-        train_ali = convert_alignments_to_tensor(train_ali, device=device)
-        valid_ali = convert_alignments_to_tensor(valid_ali, device=device)
-    else:
-        logging.info("Not using alignments")
-        train_ali = None
-        valid_ali = None
-
     librispeech = LibriSpeechAsrDataModule(args)
-    train_cuts = librispeech.train_clean_100_cuts()
+
     if params.full_libri:
-        train_cuts += librispeech.train_clean_360_cuts()
-        train_cuts += librispeech.train_other_500_cuts()
+        train_cuts = librispeech.train_all_shuf_cuts()
+    else:
+        train_cuts = librispeech.train_clean_100_cuts()
 
     def remove_short_and_long_utt(c: Cut):
         # Keep only utterances with duration between 1 second and 20 seconds
@@ -833,20 +750,19 @@ def run(rank, world_size, args):
 
     valid_cuts = librispeech.dev_clean_cuts()
     valid_cuts += librispeech.dev_other_cuts()
-    
-    # remove long and short utterances for validation, too.
-    valid_cuts = valid_cuts.filter(remove_short_and_long_utt)
-    
     valid_dl = librispeech.valid_dataloaders(valid_cuts)
-    
-    
+
+    scan_pessimistic_batches_for_oom(
+        model=model,
+        train_dl=train_dl,
+        optimizer=optimizer,
+        graph_compiler=graph_compiler,
+        params=params,
+    )
+
     for epoch in range(params.start_epoch, params.num_epochs):
         fix_random_seed(params.seed + epoch)
         train_dl.sampler.set_epoch(epoch)
-        if params.batch_idx_train >= params.use_ali_until and train_ali is not None:
-            # Delete the alignments to save memory
-            train_ali = None
-            valid_ali = None
 
         cur_lr = optimizer._rate
         if tb_writer is not None:
@@ -865,8 +781,6 @@ def run(rank, world_size, args):
             graph_compiler=graph_compiler,
             train_dl=train_dl,
             valid_dl=valid_dl,
-            train_ali=train_ali,
-            valid_ali=valid_ali,
             tb_writer=tb_writer,
             world_size=world_size,
         )
@@ -879,22 +793,57 @@ def run(rank, world_size, args):
         )
 
     logging.info("Done!")
-    total_time = time.time() - start_time
-    total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-    print('Training time {}'.format(total_time_str))
 
     if world_size > 1:
         torch.distributed.barrier()
         cleanup_dist()
 
 
+def scan_pessimistic_batches_for_oom(
+    model: nn.Module,
+    train_dl: torch.utils.data.DataLoader,
+    optimizer: torch.optim.Optimizer,
+    graph_compiler: BpeCtcTrainingGraphCompiler,
+    params: AttributeDict,
+):
+    from lhotse.dataset import find_pessimistic_batches
+
+    logging.info(
+        "Sanity check -- see if any of the batches in epoch 0 would cause OOM."
+    )
+    batches, crit_values = find_pessimistic_batches(train_dl.sampler)
+    for criterion, cuts in batches.items():
+        batch = train_dl.dataset[cuts]
+        try:
+            optimizer.zero_grad()
+            loss, _, _, _ = compute_loss(
+                params=params,
+                model=model,
+                batch=batch,
+                graph_compiler=graph_compiler,
+                is_training=True,
+            )
+            loss.backward()
+            clip_grad_norm_(model.parameters(), 5.0, 2.0)
+            optimizer.step()
+        except RuntimeError as e:
+            if "CUDA out of memory" in str(e):
+                logging.error(
+                    "Your GPU ran out of memory with the current "
+                    "max_duration setting. We recommend decreasing "
+                    "max_duration and trying again.\n"
+                    f"Failing criterion: {criterion} "
+                    f"(={crit_values[criterion]}) ..."
+                )
+            raise
+
+
 def main():
-    
-    
     parser = get_parser()
     LibriSpeechAsrDataModule.add_arguments(parser)
     args = parser.parse_args()
     args.exp_dir = Path(args.exp_dir)
+    args.lang_dir = Path(args.lang_dir)
 
     world_size = args.world_size
     assert world_size >= 1
